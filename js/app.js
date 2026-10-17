@@ -58,7 +58,9 @@
   // 著者名の正規化：「東野 圭吾／著」→「東野圭吾」
   function cleanAuthor(s) {
     let n = String(s || "").normalize("NFKC").trim();
-    n = n.replace(/\s*[\/／]?\s*(著|作|文|訳|編|著者|原作|原著|画|絵|監修|編著|作・絵|文・絵)\s*$/, "");
+    // 「燃え殻 原案」「川勝徳重 漫画」のような役割の表記を取り除く
+    n = n.replace(/\s*[\/／]?\s*(著|作|文|訳|編|著者|原作|原著|原案|画|絵|作画|漫画|まんが|マンガ|イラスト|写真|監修|編著|編集|共著|脚本|構成|解説|作・絵|文・絵|ほか著|[他ほ]か)\s*$/, "");
+    n = n.replace(/\s*[\/／]?\s*(著|作|文|訳|編|原作|原案|漫画|画|絵)\s*$/, "");
     n = n.replace(/[\/／]\s*$/, "").trim();
     // 図書館式の「豊永, 浩平, 2003-」から生没年を取り除く
     n = n.replace(/[,，\s]*\d{4}\s*-\s*(\d{4})?\s*$/, "").trim();
@@ -128,6 +130,7 @@
     if (!m) return "";
     return m[1] + (m[2] ? "-" + pad2(m[2]) : "") + (m[3] ? "-" + pad2(m[3]) : "");
   }
+  const dateEndKey = (s) => { const d = normDate(s); return d.length === 4 ? d + "-12-31" : d.length === 7 ? d + "-31" : d; };
   const dateSortKey = (s) => { const d = normDate(s); return d.length === 4 ? d + "-00-00" : d.length === 7 ? d + "-00" : d; };
 
   // ===================================================================
@@ -230,7 +233,7 @@
     async authorWorks(name, force = false) {
       const key = nameKey(name);
       const cached = data.authorCache[key];
-      if (!force && cached && cached.v === 2 && Date.now() - cached.fetchedAt < 6 * 3600e3) return cached.works;
+      if (!force && cached && cached.v === 3 && Date.now() - cached.fetchedAt < 6 * 3600e3) return cached.works;
       const seen = new Map();
       const pages = [];
       try {
@@ -268,7 +271,7 @@
       }
       // 新しく出た版（文庫化など）が上に来るように並べる
       const works = [...seen.values()].sort((a, b) => dateSortKey(b.latest || b.date).localeCompare(dateSortKey(a.latest || a.date)));
-      data.authorCache[key] = { v: 2, fetchedAt: Date.now(), works };
+      data.authorCache[key] = { v: 3, fetchedAt: Date.now(), works };
       save();
       return works;
     },
@@ -310,7 +313,7 @@
       isbn,
       title: volume && !title.includes(volume) ? `${title} ${volume}` : title,
       subtitle: "",
-      authors: normalizeAuthors(all("dc:creator").map((x) => x.textContent)),
+      authors: normalizeAuthors((all("dc:creator").length ? all("dc:creator") : all("author")).flatMap((x) => x.textContent.split(/[;；]/))),
       publisher: txt("dc:publisher"),
       publishedDate: normDate(txt("dcterms:issued") || txt("dc:date")),
       thumbnail: "",
@@ -1091,7 +1094,8 @@
     for (const a of data.favAuthors) {
       try {
         const works = await API.authorWorks(a.name, force);
-        works.filter((w) => dateSortKey(w.latest || w.date) >= borderKey).forEach((w) => items.push(Object.assign({}, w.book, { _date: w.latest || w.date })));
+        // 「2026」のように年だけの日付は、その年の末日として扱う（年初の本も新刊に入れる）
+        works.filter((w) => dateEndKey(w.latest || w.date) >= borderKey).forEach((w) => items.push(Object.assign({}, w.book, { _date: w.latest || w.date })));
       } catch (err) {
         errors.push(a.name);
       }
@@ -1103,7 +1107,10 @@
     box.innerHTML = (items.length
       ? `<p class="muted small">この1年以内に発売された本（新しい順・予約受付中を含む）</p><div class="book-list">${items.map((b) => bookRow(b, dateSortKey(b._date) > today() ? `<span class="tag tag-reading">予約受付</span>` : "")).join("")}</div>`
       : `<p class="muted small">この1年以内の新刊は見つかりませんでした。</p>`)
-      + (errors.length ? `<p class="st-ng small">${errors.map(esc).join("、")} の情報を取得できませんでした。</p>` : "");
+      + (errors.length ? `<p class="st-ng small">${errors.map(esc).join("、")} の情報を取得できませんでした。</p>` : "")
+      + (Date.now() < googleBlockedUntil && !data.settings.googleKey
+        ? `<p class="muted small">いまは国立国会図書館の情報だけで表示しています。発売前（予約受付中）の本や発売直後の本は出ないことがあります。<a href="#more">設定でGoogle BooksのAPIキーを登録</a>すると表示されるようになります。</p>`
+        : "");
   }
 
   function renderAuthor([name]) {
