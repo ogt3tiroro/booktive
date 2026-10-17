@@ -1,0 +1,12 @@
+{
+  "name": "本活 Booktive",
+  "short_name": "本活",
+  "description": "本の検索・読書記録・好きな作家・図書館予約をひとつに",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f3f4f1",
+  "theme_color": "#24406e",
+  "lang": "ja",
+  "icons": [{ "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
