@@ -120,11 +120,13 @@
   }
 
   // 日付 "2023" / "2023-04" / "20230415" → "2023-04-15" 形式に揃える
+  // "2025.10" "2025年10月5日" "2025/10/05" なども同じ形に揃える
   function normDate(s) {
-    s = String(s || "").replace(/[^0-9-]/g, "");
-    if (/^\d{8}$/.test(s)) return `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6)}`;
-    if (/^\d{6}$/.test(s)) return `${s.slice(0, 4)}-${s.slice(4, 6)}`;
-    return s;
+    s = String(s || "").normalize("NFKC").trim();
+    let m = s.match(/^(\d{4})(\d{2})(\d{2})?$/);
+    if (!m) m = s.match(/(\d{4})(?:\D{1,2}(\d{1,2}))?(?:\D{1,2}(\d{1,2}))?/);
+    if (!m) return "";
+    return m[1] + (m[2] ? "-" + pad2(m[2]) : "") + (m[3] ? "-" + pad2(m[3]) : "");
   }
   const dateSortKey = (s) => { const d = normDate(s); return d.length === 4 ? d + "-00-00" : d.length === 7 ? d + "-00" : d; };
 
@@ -228,7 +230,7 @@
     async authorWorks(name, force = false) {
       const key = nameKey(name);
       const cached = data.authorCache[key];
-      if (!force && cached && Date.now() - cached.fetchedAt < 24 * 3600e3) return cached.works;
+      if (!force && cached && cached.v === 2 && Date.now() - cached.fetchedAt < 6 * 3600e3) return cached.works;
       const seen = new Map();
       const pages = [];
       try {
@@ -240,7 +242,15 @@
       } catch {
         pages.length = 0;
       }
-      if (!pages.length) pages.push(await API.ndl({ creator: name, cnt: 200 }));
+      // 国立国会図書館サーチでは、直近2年の本を出版日で絞って確実に拾う（作品数の多い作家でも新刊が埋もれない）
+      const since = new Date(Date.now() - 2 * 365 * 24 * 3600e3);
+      const [recent, general] = await Promise.all([
+        API.ndl({ creator: name, from: `${since.getFullYear()}-${pad2(since.getMonth() + 1)}`, cnt: 200 }).catch(() => null),
+        pages.length ? [] : API.ndl({ creator: name, cnt: 300 }).catch(() => null),
+      ]);
+      if (recent) pages.push(recent);
+      if (general) pages.push(general);
+      if (!pages.length) throw new Error("作品情報を取得できませんでした。通信状態を確認してください。");
       for (const page of pages) {
         const items = page.filter((b) => b.authors.some((a) => nameKey(a) === key));
         for (const b of items) {
@@ -256,8 +266,9 @@
           }
         }
       }
-      const works = [...seen.values()].sort((a, b) => dateSortKey(b.date).localeCompare(dateSortKey(a.date)));
-      data.authorCache[key] = { fetchedAt: Date.now(), works };
+      // 新しく出た版（文庫化など）が上に来るように並べる
+      const works = [...seen.values()].sort((a, b) => dateSortKey(b.latest || b.date).localeCompare(dateSortKey(a.latest || a.date)));
+      data.authorCache[key] = { v: 2, fetchedAt: Date.now(), works };
       save();
       return works;
     },
@@ -1073,7 +1084,7 @@
     const box = $("#newReleases");
     if (!box || !data.favAuthors.length) return;
     box.innerHTML = `<div class="spinner" role="progressbar" aria-label="読み込み中"></div>`;
-    const border = new Date(Date.now() - 180 * 24 * 3600e3);
+    const border = new Date(Date.now() - 365 * 24 * 3600e3);
     const borderKey = `${border.getFullYear()}-${pad2(border.getMonth() + 1)}-${pad2(border.getDate())}`;
     const items = [];
     const errors = [];
@@ -1090,8 +1101,8 @@
     items.sort((a, b) => dateSortKey(b._date).localeCompare(dateSortKey(a._date)));
     remember(items);
     box.innerHTML = (items.length
-      ? `<p class="muted small">直近6か月以内に発売された本（予約受付中を含む）</p><div class="book-list">${items.map((b) => bookRow(b, dateSortKey(b._date) > today() ? `<span class="tag tag-reading">予約受付</span>` : "")).join("")}</div>`
-      : `<p class="muted small">直近6か月以内の新刊は見つかりませんでした。</p>`)
+      ? `<p class="muted small">この1年以内に発売された本（新しい順・予約受付中を含む）</p><div class="book-list">${items.map((b) => bookRow(b, dateSortKey(b._date) > today() ? `<span class="tag tag-reading">予約受付</span>` : "")).join("")}</div>`
+      : `<p class="muted small">この1年以内の新刊は見つかりませんでした。</p>`)
       + (errors.length ? `<p class="st-ng small">${errors.map(esc).join("、")} の情報を取得できませんでした。</p>` : "");
   }
 
