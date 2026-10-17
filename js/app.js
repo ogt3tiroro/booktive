@@ -19,16 +19,12 @@
   });
 
   let data = load();
-  fixSplitAuthors();
   // 以前の版で姓と名が別の作家として保存された本を1人にまとめる
   function fixSplitAuthors() {
     let changed = false;
     for (const b of Object.values(data.books)) {
-      const a = b.authors || [];
-      if (a.length === 2 && a.every((x) => /^[\u3400-\u9fff\u3040-\u30ff々]{1,3}$/.test(x))) {
-        b.authors = [a.join("")];
-        changed = true;
-      }
+      const fixed = normalizeAuthors(b.authors);
+      if (JSON.stringify(fixed) !== JSON.stringify(b.authors || [])) { b.authors = fixed; changed = true; }
     }
     if (changed) save();
   }
@@ -64,8 +60,31 @@
     let n = String(s || "").normalize("NFKC").trim();
     n = n.replace(/\s*[\/／]?\s*(著|作|文|訳|編|著者|原作|原著|画|絵|監修|編著|作・絵|文・絵)\s*$/, "");
     n = n.replace(/[\/／]\s*$/, "").trim();
-    if (hasCJK(n)) n = n.replace(/\s+/g, "");
+    // 図書館式の「豊永, 浩平, 2003-」から生没年を取り除く
+    n = n.replace(/[,，\s]*\d{4}\s*-\s*(\d{4})?\s*$/, "").trim();
+    if (hasCJK(n)) n = n.replace(/[\s,，]+/g, "");
     return n;
+  }
+  const isYearPart = (s) => /^\d{4}\s*-?\s*(\d{4})?$/.test(String(s).trim());
+  const isShortCJK = (s) => /^[\u3400-\u9fff\u3040-\u30ff々ヶ]{1,3}$/.test(s);
+  // 作家名の一覧を整える：生没年を除き、姓と名に分かれたものを1人にまとめる
+  function normalizeAuthors(list) {
+    const out = [];
+    let lastWasMerged = false;
+    for (const raw of list || []) {
+      const n = cleanAuthor(raw);
+      if (!n || isYearPart(n)) continue;
+      const prev = out[out.length - 1];
+      // 「豊永」「浩平」のような短い2つは姓と名とみなして結合（1回だけ）
+      if (prev && !lastWasMerged && isShortCJK(prev) && isShortCJK(n)) {
+        out[out.length - 1] = prev + n;
+        lastWasMerged = true;
+      } else {
+        out.push(n);
+        lastWasMerged = false;
+      }
+    }
+    return [...new Set(out)];
   }
   const nameKey = (s) => cleanAuthor(s).replace(/\s+/g, "").toLowerCase();
 
@@ -206,7 +225,7 @@
       googleId: item.id,
       title: (v.title || "").normalize("NFKC"),
       subtitle: v.subtitle || "",
-      authors: (v.authors || []).map(cleanAuthor).filter(Boolean),
+      authors: normalizeAuthors(v.authors),
       publisher: v.publisher || "",
       publishedDate: normDate(v.publishedDate),
       thumbnail: img.replace(/^http:/, "https:"),
@@ -248,11 +267,11 @@
       .filter((c) => !c.ContributorRole || c.ContributorRole.some((r) => /^A0[1-9]$/.test(r)))
       .map((c) => cleanAuthor((c.PersonName && c.PersonName.content) || ""))
       .filter(Boolean);
-    if (fromOnix.length) return fromOnix;
+    if (fromOnix.length) return normalizeAuthors(fromOnix);
     const str = String(text || "").normalize("NFKC");
     const parts = str.match(/[^\/]+?\/\S+/g) || [str];
     const mains = parts.filter((t) => !/\/\s*(訳|翻訳|イラスト|画|絵|写真|解説|装画)/.test(t));
-    return (mains.length ? mains : parts).flatMap((t) => t.split(/[,，、]/)).map(cleanAuthor).filter(Boolean);
+    return normalizeAuthors((mains.length ? mains : parts).flatMap((t) => t.split("、")));
   }
 
   // Cコード（書籍の分類コード）の内容区分からジャンルを推定
@@ -678,9 +697,9 @@
     $("#sheetBody").innerHTML = html;
     const wasOpen = !sheet.hidden;
     sheet.hidden = false;
-    $(".sheet", sheet).scrollTop = 0;
+    $("#sheetBody").scrollTop = 0;
     document.body.style.overflow = "hidden";
-    $(".sheet-back", sheet).focus();
+    $(".sheet-close", sheet).focus();
     // スマホの「戻る」操作でも本の画面を閉じられるように履歴を1つ積む
     if (!wasOpen) history.pushState({ sheet: true }, "");
   }
@@ -1294,6 +1313,7 @@
   // ===================================================================
   // 起動
   // ===================================================================
+  fixSplitAuthors();
   route();
   if ("serviceWorker" in navigator && location.protocol === "https:") {
     navigator.serviceWorker.register("sw.js").catch(() => {});

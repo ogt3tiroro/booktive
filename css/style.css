@@ -18,6 +18,7 @@
   --f-body: "Zen Maru Gothic", "Hiragino Maru Gothic ProN", "Hiragino Sans", "Yu Gothic", "Noto Sans JP", system-ui, sans-serif;
   --radius: 10px;
   --tabbar-h: 62px;
+  --topbar-h: 58px;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -37,6 +38,7 @@ html, body { margin: 0; }
 body {
   background: var(--bg); color: var(--ink);
   font: 18px/1.75 var(--f-body);
+  padding-top: calc(var(--topbar-h) + env(safe-area-inset-top, 0px));
   padding-bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom, 0px));
   -webkit-text-size-adjust: 100%;
 }
@@ -55,11 +57,12 @@ h3 { font-size: 1rem; font-weight: 700; }
 
 /* --- top bar --- */
 body::before { content: ""; position: fixed; inset: 0 0 auto; height: env(safe-area-inset-top, 0px); background: var(--ai); z-index: 30; }
-.topbar {
-  position: sticky; top: env(safe-area-inset-top, 0px); z-index: 20;
+/* 上部の「本活 BOOKTIVE」はスクロールしても動かない */
+.topbar, .sheet-bar {
+  position: fixed; inset: 0 0 auto 0; z-index: 20; height: calc(var(--topbar-h) + env(safe-area-inset-top, 0px));
   display: flex; align-items: center; justify-content: space-between;
   background: var(--ai); color: #fff;
-  padding: 10px max(16px, env(safe-area-inset-right, 0px)) 10px max(16px, env(safe-area-inset-left, 0px));
+  padding: env(safe-area-inset-top, 0px) max(16px, env(safe-area-inset-right, 0px)) 0 max(16px, env(safe-area-inset-left, 0px));
 }
 :root:not([data-theme="light"]) .topbar { color: #fff; }
 .brand { display: flex; align-items: baseline; gap: 8px; color: #fff; text-decoration: none; }
@@ -188,21 +191,19 @@ label.field > span { font-weight: 700; }
 
 /* --- sheet (book detail) --- */
 .sheet-backdrop { position: fixed; inset: 0; z-index: 50; background: rgba(10, 14, 22, .5); display: grid; align-items: end; justify-items: center; }
-/* スマホでは画面いっぱいのページとして表示し、上端の「戻る」を常に見せる */
-.sheet { position: relative; background: var(--bg); width: 100%; height: 100%; overflow-y: auto; overscroll-behavior: contain; display: grid; align-content: start; }
-.sheet-inner { padding: 16px max(16px, env(safe-area-inset-right, 0px)) calc(28px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px)); }
-.sheet-bar { position: sticky; top: 0; z-index: 2; display: flex; align-items: center; justify-content: space-between; gap: 8px; background: var(--ai); color: #fff; padding: calc(8px + env(safe-area-inset-top, 0px)) max(12px, env(safe-area-inset-right, 0px)) 8px max(8px, env(safe-area-inset-left, 0px)); }
-.sheet-back { display: inline-flex; align-items: center; gap: 4px; background: transparent; border: 0; color: #fff; font-size: 1.05rem; font-weight: 700; padding: 6px 8px; cursor: pointer; border-radius: 8px; }
-.sheet-back svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+/* 本の画面：上部の帯は固定、中身だけスクロール */
+.sheet { position: relative; background: var(--bg); width: 100%; height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.sheet-bar { position: relative; flex: none; }
+.sheet-inner { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 16px max(16px, env(safe-area-inset-right, 0px)) calc(28px + env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px)); }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .sheet-bar { background: #1d2c47; } }
 :root[data-theme="dark"] .sheet-bar { background: #1d2c47; }
 @media (min-width: 720px) {
   .sheet-backdrop { align-items: center; }
-  .sheet { width: min(680px, 100%); height: auto; max-height: 90vh; max-height: 90dvh; border-radius: 16px; }
-  .sheet-bar { padding-top: 8px; }
+  .sheet { width: min(680px, 100%); height: min(90vh, 900px); height: min(90dvh, 900px); border-radius: 16px; }
+  .sheet-bar { height: var(--topbar-h); padding-top: 0; }
 }
 .sheet-close { width: 38px; height: 38px; border-radius: 50%; border: 1px solid rgba(255,255,255,.4); background: transparent; color: #fff; font-size: 1.5rem; line-height: 1; cursor: pointer; }
-#sheetBody { display: grid; gap: 16px; min-width: 0; }
+#sheetBody { display: grid; align-content: start; gap: 16px; min-width: 0; }
 #recordForm .chip { font-size: 1.05rem; padding: 8px 18px; }
 #recordForm h3 { font-size: 1.1rem; }
 .detail-head { display: grid; grid-template-columns: 110px 1fr; gap: 16px; }
@@ -219,7 +220,10 @@ label.field > span { font-weight: 700; }
 .lib-result .lib { display: flex; justify-content: space-between; gap: 8px; align-items: center; flex-wrap: wrap; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
 .st-ok { color: var(--good); font-weight: 700; }
 .st-ng { color: var(--warn); font-weight: 700; }
-.two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.two { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+.two > * { min-width: 0; }
+input[type="date"] { display: block; max-width: 100%; min-width: 0; -webkit-appearance: none; appearance: none; height: 52px; font-size: 1.15rem; text-align: left; }
+input[type="date"]::-webkit-date-and-time-value { text-align: left; }
 @media (max-width: 460px) { .two { grid-template-columns: 1fr; } .detail-head { grid-template-columns: 92px 1fr; } }
 
 /* --- scanner --- */
@@ -238,3 +242,4 @@ label.field > span { font-weight: 700; }
 .spinner { width: 22px; height: 22px; border: 3px solid var(--surface-2); border-top-color: var(--ai); border-radius: 50%; animation: spin .8s linear infinite; margin: 12px auto; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
+.detail-head .meta > .tag { justify-self: start; }
