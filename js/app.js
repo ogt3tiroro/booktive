@@ -19,6 +19,19 @@
   });
 
   let data = load();
+  fixSplitAuthors();
+  // 以前の版で姓と名が別の作家として保存された本を1人にまとめる
+  function fixSplitAuthors() {
+    let changed = false;
+    for (const b of Object.values(data.books)) {
+      const a = b.authors || [];
+      if (a.length === 2 && a.every((x) => /^[\u3400-\u9fff\u3040-\u30ff々]{1,3}$/.test(x))) {
+        b.authors = [a.join("")];
+        changed = true;
+      }
+    }
+    if (changed) save();
+  }
   function load() {
     try {
       const raw = localStorage.getItem(STORE_KEY);
@@ -211,9 +224,7 @@
     const texts = (onix.CollateralDetail && onix.CollateralDetail.TextContent) || [];
     const desc = (texts.find((t) => t.TextType === "03") || texts[0] || {}).Text || "";
     const extent = (onix.DescriptiveDetail && onix.DescriptiveDetail.Extent) || [];
-    const parts = String(s.author || "").split(/[,，、]|\s(?=\S+[\/／])/).filter((t) => t.trim());
-    const mains = parts.filter((t) => !/[\/／]\s*(訳|翻訳|イラスト|画|絵|写真|解説|装画)/.test(t));
-    const authors = (mains.length ? mains : parts).map(cleanAuthor).filter(Boolean);
+    const authors = parseOpenbdAuthors(onix, s.author);
     return {
       id: s.isbn,
       isbn: s.isbn,
@@ -228,6 +239,20 @@
       genre: genreFromCcode(ccode),
       series: s.series || "",
     };
+  }
+
+  // openBDの著者：ONIXの著者情報を優先し、なければ「東野 圭吾／著」形式の文字列を役割ごとに区切る
+  function parseOpenbdAuthors(onix, text) {
+    const contribs = (onix.DescriptiveDetail && onix.DescriptiveDetail.Contributor) || [];
+    const fromOnix = contribs
+      .filter((c) => !c.ContributorRole || c.ContributorRole.some((r) => /^A0[1-9]$/.test(r)))
+      .map((c) => cleanAuthor((c.PersonName && c.PersonName.content) || ""))
+      .filter(Boolean);
+    if (fromOnix.length) return fromOnix;
+    const str = String(text || "").normalize("NFKC");
+    const parts = str.match(/[^\/]+?\/\S+/g) || [str];
+    const mains = parts.filter((t) => !/\/\s*(訳|翻訳|イラスト|画|絵|写真|解説|装画)/.test(t));
+    return (mains.length ? mains : parts).flatMap((t) => t.split(/[,，、]/)).map(cleanAuthor).filter(Boolean);
   }
 
   // Cコード（書籍の分類コード）の内容区分からジャンルを推定
@@ -651,15 +676,28 @@
   function openSheet(html) {
     lastFocus = document.activeElement;
     $("#sheetBody").innerHTML = html;
+    const wasOpen = !sheet.hidden;
     sheet.hidden = false;
+    $(".sheet", sheet).scrollTop = 0;
     document.body.style.overflow = "hidden";
-    $(".sheet-close", sheet).focus();
+    $(".sheet-back", sheet).focus();
+    // スマホの「戻る」操作でも本の画面を閉じられるように履歴を1つ積む
+    if (!wasOpen) history.pushState({ sheet: true }, "");
   }
-  function closeSheet() {
+  // then: 閉じたあとに行う処理（画面の移動など）
+  function closeSheet(then) {
+    if (sheet.hidden) { if (then) then(); return; }
     sheet.hidden = true;
     document.body.style.overflow = "";
     if (lastFocus && lastFocus.focus) lastFocus.focus();
+    if (history.state && history.state.sheet) {
+      if (then) window.addEventListener("popstate", () => then(), { once: true });
+      history.back();
+    } else if (then) then();
   }
+  window.addEventListener("popstate", () => {
+    if (!sheet.hidden) { sheet.hidden = true; document.body.style.overflow = ""; }
+  });
   sheet.addEventListener("click", (e) => { if (e.target === sheet || e.target.closest("[data-close]")) closeSheet(); });
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !sheet.hidden) closeSheet(); });
 
@@ -693,7 +731,7 @@
           </label>
         </div>
         <div class="rating-box">
-          <span class="field" style="font-weight:700;color:var(--ink-soft);font-size:.85rem">評価（0.0〜5.0　0.0は評価なし）</span>
+          <span class="field" style="font-weight:700;color:var(--ink-soft);font-size:1rem">評価（0.0〜5.0　0.0は評価なし）</span>
           <div class="row"><span class="stars" id="ratingStars"><i style="width:${(ratingVal / 5) * 100}%"></i></span><output class="rating-num" id="ratingOut" style="font-size:1.4rem">${(+ratingVal).toFixed(1)}</output></div>
           <input type="range" id="rating" min="0" max="5" step="0.1" value="${ratingVal}" aria-label="評価">
         </div>
@@ -749,15 +787,14 @@
       if (rec.status === "read" && !rec.readDate) rec.readDate = today();
       upsertBook(rec);
       toast(saved ? "更新しました" : `「${rec.title}」を${STATUS[rec.status]}に登録しました`);
-      closeSheet();
-      route();
+      closeSheet(route);
     });
     const del = $("#delBook");
     if (del) del.addEventListener("click", () => {
-      if (del.dataset.confirm) { delete data.books[saved.id]; save(); toast("本棚から削除しました"); closeSheet(); route(); }
+      if (del.dataset.confirm) { delete data.books[saved.id]; save(); toast("本棚から削除しました"); closeSheet(route); }
       else { del.dataset.confirm = "1"; del.textContent = "もう一度押すと削除します"; }
     });
-    $$("[data-author]", sheet).forEach((el) => el.addEventListener("click", () => { closeSheet(); location.hash = "#author/" + encodeURIComponent(el.dataset.author); }));
+    $$("[data-author]", sheet).forEach((el) => el.addEventListener("click", () => closeSheet(() => { location.hash = "#author/" + encodeURIComponent(el.dataset.author); })));
     const chk = $("#libCheck");
     if (chk) chk.addEventListener("click", () => runLibCheck(b));
   }
