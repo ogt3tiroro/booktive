@@ -124,6 +124,25 @@
       return items[0] || null;
     },
 
+    // 国立国会図書館サーチから日本十進分類（NDC）を取得
+    async ndc(isbn) {
+      const r = await fetch("https://ndlsearch.ndl.go.jp/api/opensearch?cnt=1&isbn=" + isbn);
+      if (!r.ok) return "";
+      const xml = new DOMParser().parseFromString(await r.text(), "application/xml");
+      const subs = [...xml.getElementsByTagName("dc:subject")];
+      const ndc = subs.find((x) => /NDC/.test(x.getAttribute("xsi:type") || ""));
+      return ndc ? ndc.textContent.trim() : "";
+    },
+
+    async googleCategories(id) {
+      const u = new URL("https://www.googleapis.com/books/v1/volumes/" + encodeURIComponent(id));
+      if (data.settings.googleKey) u.searchParams.set("key", data.settings.googleKey);
+      const r = await fetch(u);
+      if (!r.ok) return "";
+      const j = await r.json();
+      return ((j.volumeInfo && j.volumeInfo.categories) || []).join(" ");
+    },
+
     async openbd(isbn) {
       const r = await fetch("https://api.openbd.jp/v1/get?isbn=" + isbn);
       if (!r.ok) return null;
@@ -171,6 +190,7 @@
     return {
       id: isbn || "g:" + item.id,
       isbn,
+      googleId: item.id,
       title: (v.title || "").normalize("NFKC"),
       subtitle: v.subtitle || "",
       authors: (v.authors || []).map(cleanAuthor).filter(Boolean),
@@ -226,6 +246,48 @@
     if (/^7/.test(content)) return "趣味・実用";
     return "";
   }
+  // NDC（日本十進分類）からジャンルを推定
+  function genreFromNdc(n) {
+    n = String(n || "").trim();
+    if (!n) return "";
+    if (/^726\.1/.test(n)) return "コミック";
+    if (/^(E|K|726\.6)/.test(n)) return "絵本・児童書";
+    if (/^913/.test(n)) return "日本の小説";
+    if (/^9[2-9]3/.test(n)) return "海外の小説";
+    if (/^9\d[45]/.test(n)) return "エッセイ・随筆";
+    if (/^91/.test(n)) return "日本の小説";
+    if (/^9/.test(n)) return "海外の小説";
+    if (/^28/.test(n)) return "ノンフィクション";
+    if (/^2/.test(n)) return "歴史・時代";
+    if (/^(159|33[56])/.test(n)) return "ビジネス・自己啓発";
+    if (/^(59|7)/.test(n)) return "趣味・実用";
+    if (/^[45]/.test(n)) return "科学・技術";
+    if (/^[13]/.test(n)) return "人文・社会";
+    return "その他";
+  }
+  // 書名・あらすじのことばで小説のジャンルを細かくする
+  function refineGenre(g, b) {
+    const text = [b.title, b.subtitle, b.series, b.description].filter(Boolean).join(" ");
+    if (!g || g === "日本の小説" || g === "海外の小説") {
+      if (/ミステリ|推理|探偵|殺人事件|謎解き|本格|刑事|警察小説/.test(text)) return "ミステリー";
+      if (/SF|ファンタジー|異世界|魔法|宇宙|ロボット|タイムトラベル/.test(text)) return "SF・ファンタジー";
+      if (/時代小説|歴史小説|江戸|戦国|幕末|武将|藩|侍/.test(text)) return "歴史・時代";
+    }
+    if (!g && /小説|長編|短編|物語/.test(text)) return "日本の小説";
+    return g;
+  }
+  // 検索後の本の分類を自動で決める
+  async function autoGenre(b) {
+    let g = b.genre || "";
+    if (!g && b.isbn) {
+      const bd = await API.openbd(b.isbn).catch(() => null);
+      if (bd && bd.genre) g = bd.genre;
+    }
+    if (!g && b.isbn) g = genreFromNdc(await API.ndc(b.isbn).catch(() => ""));
+    if (!g && b.googleId) g = guessGenreFromText(await API.googleCategories(b.googleId).catch(() => ""));
+    return refineGenre(g, b) || "その他";
+  }
+
   function guessGenreFromText(t) {
     if (!t) return "";
     if (/comic|manga/i.test(t)) return "コミック";
@@ -238,7 +300,12 @@
     return "";
   }
 
-  const coverUrl = (b) => b.thumbnail || (b.isbn ? `https://ndlsearch.ndl.go.jp/thumbnail/${b.isbn}.jpg` : "");
+  // 表紙画像の候補（Google Books → 国立国会図書館 → openBD の順に試す）
+  const coverUrls = (b) => [
+    b.thumbnail,
+    b.isbn && `https://ndlsearch.ndl.go.jp/thumbnail/${b.isbn}.jpg`,
+    b.isbn && `https://cover.openbd.jp/${b.isbn}.jpg`,
+  ].filter(Boolean);
 
   // カーリルAPIはJSONPで呼び出す
   function jsonp(url, timeout = 20000) {
@@ -284,7 +351,7 @@
 
   function upsertBook(b) {
     const prev = data.books[b.id] || {};
-    data.books[b.id] = Object.assign({ addedAt: new Date().toISOString(), rating: null, comment: "", readDate: "", genre: "", status: "want" }, prev, b);
+    data.books[b.id] = Object.assign({ addedAt: new Date().toISOString(), rating: 0, comment: "", readDate: "", genre: "", status: "want" }, prev, b);
     save();
   }
   function toggleFav(name) {
@@ -313,19 +380,27 @@
     toastTimer = setTimeout(() => (t.hidden = true), 2800);
   }
 
-  const starsHtml = (r) => r == null || r === ""
+  const hasRating = (b) => b.rating != null && +b.rating > 0;
+  const starsHtml = (r) => r == null || r === "" || +r === 0
     ? `<span class="muted small">未評価</span>`
     : `<span class="stars" aria-label="評価 ${(+r).toFixed(1)}"><i style="width:${(+r / 5) * 100}%"></i></span> <span class="rating-num">${(+r).toFixed(1)}</span>`;
 
   const tagHtml = (status) => status ? `<span class="tag tag-${status}">${STATUS[status]}</span>` : "";
 
   function coverHtml(b) {
-    const url = coverUrl(b);
-    return `<div class="cover">${url ? `<img src="${esc(url)}" alt="" loading="lazy">` : ""}<div class="ph" ${url ? 'style="z-index:-1"' : ""}>${esc(b.title).slice(0, 40)}</div></div>`;
+    const [url, ...alts] = coverUrls(b);
+    return `<div class="cover">${url ? `<img src="${esc(url)}" data-alts="${esc(alts.join(" "))}" alt="" loading="lazy">` : ""}<div class="ph" ${url ? 'style="z-index:-1"' : ""}>${esc(b.title).slice(0, 40)}</div></div>`;
   }
+  // 1ピクセルなどの「画像なし」応答も失敗として扱う
+  document.addEventListener("load", (e) => {
+    const img = e.target;
+    if (img.tagName === "IMG" && img.closest(".cover") && img.naturalWidth < 10) img.dispatchEvent(new Event("error"));
+  }, true);
   // 画像の読み込みに失敗したら表紙の代わりにタイトル帯を出す
   document.addEventListener("error", (e) => {
     if (e.target.tagName === "IMG" && e.target.parentElement && e.target.parentElement.classList.contains("cover")) {
+      const alts = (e.target.dataset.alts || "").split(" ").filter(Boolean);
+      if (alts.length) { e.target.dataset.alts = alts.slice(1).join(" "); e.target.src = alts[0]; return; }
       const ph = e.target.parentElement.querySelector(".ph");
       if (ph) ph.style.zIndex = "";
       e.target.remove();
@@ -338,7 +413,7 @@
       ${coverHtml(b)}
       <span class="t">${esc(b.title)}</span>
       <span class="a">${esc((b.authors || []).join("、"))}</span>
-      ${shelf && shelf.status === "read" && shelf.rating != null ? `<span>${starsHtml(shelf.rating)}</span>` : shelf ? `<span>${tagHtml(shelf.status)}</span>` : ""}
+      ${shelf && shelf.status === "read" && hasRating(shelf) ? `<span class="tag-line">${starsHtml(shelf.rating)}</span>` : shelf ? `<span class="tag-line">${tagHtml(shelf.status)}</span>` : ""}
       ${extra}
     </button>`;
   }
@@ -388,7 +463,12 @@
   // ===================================================================
   // 本棚
   // ===================================================================
-  const shelfState = { status: "all", group: "none", sort: "added", q: "" };
+  const shelfState = { status: "all", group: "none", sort: "added", size: "m", q: "" };
+  const SIZES = [["list", "明細"], ["s", "小"], ["m", "中"], ["l", "大"]];
+  // 本の並べ方（明細／表紙の大中小）
+  const shelfBooksHtml = (books) => shelfState.size === "list"
+    ? `<div class="book-list">${books.map((b) => bookRow(b)).join("")}</div>`
+    : `<div class="book-grid size-${shelfState.size}">${books.map((b) => bookCard(b)).join("")}</div>`;
   try { Object.assign(shelfState, JSON.parse(localStorage.getItem("booktive:shelfState") || "{}"), { q: "" }); } catch {}
 
   function renderShelf() {
@@ -415,6 +495,9 @@
           <div class="seg" role="group" aria-label="まとめ方">
             ${[["none", "一覧"], ["author", "作家別"], ["genre", "分類別"]].map(([k, l]) => `<button type="button" data-group="${k}" aria-pressed="${shelfState.group === k}">${l}</button>`).join("")}
           </div>
+          <div class="seg" role="group" aria-label="表示方法">
+            ${SIZES.map(([k, l]) => `<button type="button" data-size="${k}" aria-pressed="${shelfState.size === k}">${l}</button>`).join("")}
+          </div>
           <select id="shelfSort" aria-label="並び順" style="width:auto">
             <option value="added">登録順</option><option value="readDate">読了日順</option><option value="rating">評価順</option><option value="title">書名順</option>
           </select>
@@ -433,6 +516,11 @@
     $$("[data-group]").forEach((b) => b.addEventListener("click", () => {
       shelfState.group = b.dataset.group; persist();
       $$("[data-group]").forEach((x) => x.setAttribute("aria-pressed", x === b));
+      drawShelf();
+    }));
+    $$("[data-size]").forEach((b) => b.addEventListener("click", () => {
+      shelfState.size = b.dataset.size; persist();
+      $$("[data-size]").forEach((x) => x.setAttribute("aria-pressed", x === b));
       drawShelf();
     }));
     $("#shelfSort").addEventListener("change", (e) => { shelfState.sort = e.target.value; persist(); drawShelf(); });
@@ -463,7 +551,7 @@
     if (!list.length) { box.innerHTML = `<div class="empty">条件に合う本はありません</div>`; return; }
 
     if (shelfState.group === "none") {
-      box.innerHTML = `<div class="book-grid">${list.map((b) => bookCard(b)).join("")}</div>`;
+      box.innerHTML = shelfBooksHtml(list);
       return;
     }
     const groups = new Map();
@@ -477,7 +565,7 @@
         <div class="group-title"><h3>${esc(k)}</h3><span class="muted small num">${books.length}冊</span>
           ${shelfState.group === "author" && k !== "著者不明" ? `<a class="small" style="margin-left:auto" href="#author/${encodeURIComponent(k)}">作家ページ →</a>` : ""}
         </div>
-        <div class="book-grid">${books.map((b) => bookCard(b)).join("")}</div>
+        ${shelfBooksHtml(books)}
       </section>`).join("");
   }
 
@@ -500,7 +588,7 @@
             </select>
             <button class="btn btn-ghost" type="button" id="scanBtn">
               <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" style="fill:none;stroke:currentColor;stroke-width:1.8"><path d="M3 5v14M6 5v14M9 5v14M12 5v14M16 5v14M18 5v14M21 5v14"/></svg>
-              バーコードで検索
+              バーコード
             </button>
           </div>
         </form>
@@ -567,7 +655,7 @@
     const saved = findShelfBook(src);
     const b = Object.assign({}, src, saved || {});
     const awards = awardsFor(b);
-    const ratingVal = b.rating == null ? 3 : b.rating;
+    const ratingVal = b.rating == null ? 0 : +b.rating;
     openSheet(`
       <div class="detail-head">
         ${coverHtml(b)}
@@ -593,16 +681,13 @@
           </label>
         </div>
         <div class="rating-box">
-          <div class="row" style="justify-content:space-between">
-            <span class="field" style="font-weight:700;color:var(--ink-soft);font-size:.85rem">評価（0.0〜5.0）</span>
-            <label class="small"><input type="checkbox" id="noRating" ${b.rating == null ? "checked" : ""}> 評価しない</label>
-          </div>
+          <span class="field" style="font-weight:700;color:var(--ink-soft);font-size:.85rem">評価（0.0〜5.0　0.0は評価なし）</span>
           <div class="row"><span class="stars" id="ratingStars"><i style="width:${(ratingVal / 5) * 100}%"></i></span><output class="rating-num" id="ratingOut" style="font-size:1.4rem">${(+ratingVal).toFixed(1)}</output></div>
-          <input type="range" id="rating" min="0" max="5" step="0.1" value="${ratingVal}" aria-label="評価" ${b.rating == null ? "disabled" : ""}>
+          <input type="range" id="rating" min="0" max="5" step="0.1" value="${ratingVal}" aria-label="評価">
         </div>
         <label class="field"><span>感想・コメント</span><textarea id="comment" placeholder="印象に残った場面、ひとことメモなど">${esc(b.comment || "")}</textarea></label>
         <div class="row">
-          <button class="btn" type="submit">${saved ? "記録を更新" : "本棚に登録"}</button>
+          <button class="btn" type="submit">${saved ? "更新" : "本棚に登録"}</button>
           ${saved ? `<button class="btn btn-danger" type="button" id="delBook">本棚から削除</button>` : ""}
         </div>
       </form>
@@ -615,6 +700,16 @@
       </section>`);
 
     let status = saved ? saved.status : "";
+    const genreSel = $("#genre");
+    if (!b.genre) {
+      genreSel.insertAdjacentHTML("afterbegin", `<option value="" selected>分類を調べています…</option>`);
+      genreSel.value = "";
+      let touched = false;
+      genreSel.addEventListener("change", () => (touched = true));
+      autoGenre(b).then((g) => {
+        if (!touched && genreSel.isConnected) { genreSel.firstElementChild.remove(); genreSel.value = g; }
+      });
+    }
     const form = $("#recordForm");
     $("#statusPick").addEventListener("click", (e) => {
       const c = e.target.closest("[data-st]"); if (!c) return;
@@ -628,8 +723,6 @@
       $("#ratingStars i").style.width = (range.value / 5) * 100 + "%";
     };
     range.addEventListener("input", syncRating);
-    $("#noRating").addEventListener("change", (e) => { range.disabled = e.target.checked; $("#ratingOut").textContent = e.target.checked ? "—" : (+range.value).toFixed(1); });
-    if (b.rating == null) $("#ratingOut").textContent = "—";
 
     form.addEventListener("submit", (e) => {
       e.preventDefault();
@@ -638,12 +731,12 @@
         status,
         readDate: $("#readDate").value,
         genre: $("#genre").value,
-        rating: $("#noRating").checked ? null : Math.round(+range.value * 10) / 10,
+        rating: Math.round(+range.value * 10) / 10,
         comment: $("#comment").value.trim(),
       });
       if (rec.status === "read" && !rec.readDate) rec.readDate = today();
       upsertBook(rec);
-      toast(saved ? "記録を更新しました" : `「${rec.title}」を${STATUS[rec.status]}に登録しました`);
+      toast(saved ? "更新しました" : `「${rec.title}」を${STATUS[rec.status]}に登録しました`);
       closeSheet();
       route();
     });
@@ -850,7 +943,7 @@
     if (!name) { location.hash = "#authors"; return; }
     const fav = isFav(name);
     const myBooks = allBooks().filter((b) => (b.authors || []).some((a) => nameKey(a) === nameKey(name)));
-    const ratings = myBooks.filter((b) => b.status === "read" && b.rating != null).map((b) => b.rating);
+    const ratings = myBooks.filter((b) => b.status === "read" && hasRating(b)).map((b) => b.rating);
     view.innerHTML = `
       <section class="section">
         <a class="small" href="#authors">← 作家一覧</a>
@@ -920,7 +1013,7 @@
     const max = Math.max(4, ...months.map((m) => m.length));
     const now = new Date();
     const curMonth = now.getFullYear() === statsYear ? now.getMonth() : -1;
-    const rated = inYear.filter((b) => b.rating != null);
+    const rated = inYear.filter(hasRating);
     const pages = inYear.reduce((s, b) => s + (b.pageCount || 0), 0);
     const best = [...rated].sort((a, b) => b.rating - a.rating).slice(0, 5);
     const genreCounts = {};
