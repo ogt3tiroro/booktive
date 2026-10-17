@@ -131,29 +131,71 @@
   // ===================================================================
   // 外部API（Google Books / openBD / 国立国会図書館の書影 / カーリル）
   // ===================================================================
+  // Google Books はAPIキーなしだと利用上限（429）になりやすいので、
+  // 上限に達したらしばらく使わず、国立国会図書館サーチなどに切り替える
+  let googleBlockedUntil = 0;
   const API = {
     async google(params) {
+      if (Date.now() < googleBlockedUntil && !data.settings.googleKey) throw new Error("google-limit");
       const u = new URL("https://www.googleapis.com/books/v1/volumes");
       Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, v));
       if (data.settings.googleKey) u.searchParams.set("key", data.settings.googleKey);
       const r = await fetch(u);
-      if (r.status === 429) throw new Error("Google Books の利用上限に達しました。しばらく待つか、設定でAPIキーを登録してください。");
+      if (r.status === 429 || r.status === 403) { googleBlockedUntil = Date.now() + 10 * 60e3; throw new Error("google-limit"); }
       if (!r.ok) throw new Error(`検索に失敗しました（${r.status}）`);
       return r.json();
     },
 
-    async search(q) {
-      const j = await API.google({ q, maxResults: 30, printType: "books", langRestrict: "ja" });
-      return (j.items || []).map(fromGoogle).filter((b) => b.title);
+    // 国立国会図書館サーチ（OpenSearch）で本を探す
+    async ndl(params) {
+      const u = new URL("https://ndlsearch.ndl.go.jp/api/opensearch");
+      Object.entries(Object.assign({ cnt: 40, mediatype: 1 }, params)).forEach(([k, v]) => u.searchParams.set(k, v));
+      const r = await fetch(u);
+      if (!r.ok) throw new Error(`検索に失敗しました（${r.status}）`);
+      const xml = new DOMParser().parseFromString(await r.text(), "application/xml");
+      const seen = new Set();
+      return [...xml.getElementsByTagName("item")].map(fromNdl).filter((b) => {
+        const k = b.isbn || titleKey(b.title) + "|" + b.authors.join();
+        if (!b.title || seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+    },
+
+    async search(q, field = "all") {
+      try {
+        const query = field === "title" ? `intitle:${q}` : field === "author" ? `inauthor:"${q}"` : q;
+        const j = await API.google({ q: query, maxResults: 30, printType: "books", langRestrict: "ja" });
+        const items = (j.items || []).map(fromGoogle).filter((b) => b.title);
+        if (items.length) return items;
+      } catch {}
+      const params = field === "title" ? { title: q } : field === "author" ? { creator: q } : { any: q };
+      return API.ndl(params);
     },
 
     async byIsbn(isbn) {
       const fromBd = await API.openbd(isbn).catch(() => null);
-      if (fromBd) return fromBd;
-      const j = await API.google({ q: "isbn:" + isbn });
+      if (fromBd && fromBd.title) return fromBd;
+      const fromNdlList = await API.ndl({ isbn, cnt: 5 }).catch(() => []);
+      const hit = fromNdlList.find((b) => b.isbn === isbn) || fromNdlList[0];
+      if (hit) return Object.assign(hit, { id: isbn, isbn });
+      const j = await API.google({ q: "isbn:" + isbn }).catch(() => ({}));
       const items = (j.items || []).map(fromGoogle);
-      if (items[0]) { items[0].isbn = isbn; items[0].id = isbn; }
-      return items[0] || null;
+      if (items[0]) return Object.assign(items[0], { id: isbn, isbn });
+      return API.openLibrary(isbn).catch(() => null);
+    },
+
+    async openLibrary(isbn) {
+      const r = await fetch(`https://openlibrary.org/api/books?bibkeys=ISBN:${isbn}&format=json&jscmd=data`);
+      if (!r.ok) return null;
+      const rec = (await r.json())["ISBN:" + isbn];
+      if (!rec) return null;
+      return {
+        id: isbn, isbn, title: (rec.title || "").normalize("NFKC"), subtitle: rec.subtitle || "",
+        authors: normalizeAuthors((rec.authors || []).map((a) => a.name)),
+        publisher: ((rec.publishers || [])[0] || {}).name || "", publishedDate: normDate(rec.publish_date || ""),
+        thumbnail: (rec.cover && rec.cover.medium) || "", description: "", pageCount: rec.number_of_pages || 0, genre: "",
+      };
     },
 
     // 国立国会図書館サーチから日本十進分類（NDC）を取得
@@ -188,9 +230,19 @@
       const cached = data.authorCache[key];
       if (!force && cached && Date.now() - cached.fetchedAt < 24 * 3600e3) return cached.works;
       const seen = new Map();
-      for (const startIndex of [0, 40, 80]) {
-        const j = await API.google({ q: `inauthor:"${name}"`, maxResults: 40, startIndex, printType: "books", orderBy: "newest" });
-        const items = (j.items || []).map(fromGoogle).filter((b) => b.authors.some((a) => nameKey(a) === key));
+      const pages = [];
+      try {
+        for (const startIndex of [0, 40, 80]) {
+          const j = await API.google({ q: `inauthor:"${name}"`, maxResults: 40, startIndex, printType: "books", orderBy: "newest" });
+          pages.push((j.items || []).map(fromGoogle));
+          if (!j.items || j.items.length < 40) break;
+        }
+      } catch {
+        pages.length = 0;
+      }
+      if (!pages.length) pages.push(await API.ndl({ creator: name, cnt: 200 }));
+      for (const page of pages) {
+        const items = page.filter((b) => b.authors.some((a) => nameKey(a) === key));
         for (const b of items) {
           const k = titleKey(b.title);
           if (!k) continue;
@@ -203,7 +255,6 @@
             if (!prev.thumbnail && b.thumbnail) prev.thumbnail = b.thumbnail;
           }
         }
-        if (!j.items || j.items.length < 40) break;
       }
       const works = [...seen.values()].sort((a, b) => dateSortKey(b.date).localeCompare(dateSortKey(a.date)));
       data.authorCache[key] = { fetchedAt: Date.now(), works };
@@ -232,6 +283,30 @@
       description: v.description || "",
       pageCount: v.pageCount || 0,
       genre: guessGenreFromText((v.categories || []).join(" ")),
+    };
+  }
+
+  function fromNdl(item) {
+    const txt = (tag) => { const el = item.getElementsByTagName(tag)[0]; return el ? el.textContent.trim() : ""; };
+    const all = (tag) => [...item.getElementsByTagName(tag)];
+    const isbnEl = all("dc:identifier").find((x) => /ISBN/i.test(x.getAttribute("xsi:type") || ""));
+    const isbn = isbnEl ? normalizeIsbnInput(isbnEl.textContent) : "";
+    const ndcEl = all("dc:subject").find((x) => /NDC/.test(x.getAttribute("xsi:type") || ""));
+    const volume = txt("dcndl:volume");
+    const title = (txt("dc:title") || txt("title")).normalize("NFKC");
+    return {
+      id: isbn || "ndl:" + (txt("link") || title),
+      isbn,
+      title: volume && !title.includes(volume) ? `${title} ${volume}` : title,
+      subtitle: "",
+      authors: normalizeAuthors(all("dc:creator").map((x) => x.textContent)),
+      publisher: txt("dc:publisher"),
+      publishedDate: normDate(txt("dcterms:issued") || txt("dc:date")),
+      thumbnail: "",
+      description: txt("description").replace(/<[^>]+>/g, " ").trim().slice(0, 600),
+      pageCount: 0,
+      genre: ndcEl ? genreFromNdc(ndcEl.textContent) : "",
+      series: txt("dcndl:seriesTitle"),
     };
   }
 
@@ -668,16 +743,24 @@
       let results;
       if (isbn && /^[\d\-\sXx]+$/.test(q)) {
         const b = await API.byIsbn(isbn);
-        results = b ? [b] : [];
+        if (!b) { drawIsbnNotFound(isbn); return; }
+        results = [b];
       } else {
-        const query = field === "title" ? `intitle:${q}` : field === "author" ? `inauthor:"${q}"` : q;
-        results = await API.search(query);
+        results = await API.search(q, field);
       }
       lastSearch = { q, results: remember(results) };
       drawResults(results);
     } catch (err) {
-      box.innerHTML = `<div class="empty">${esc(err.message || "検索に失敗しました。通信状態を確認してください。")}</div>`;
+      box.innerHTML = `<div class="empty">本の情報を取得できませんでした。通信状態を確認して、もう一度お試しください。</div>`;
     }
+  }
+  // 本の情報が見つからないISBNは、書名と作家を手入力して登録できるようにする
+  function drawIsbnNotFound(isbn) {
+    const box = $("#searchResults");
+    if (!box) return;
+    const b = { id: isbn, isbn, title: "", authors: [], publisher: "", publishedDate: "", thumbnail: "", description: "", pageCount: 0, genre: "", _manual: true };
+    remember([b]);
+    box.innerHTML = `<div class="empty"><strong>ISBN ${esc(isbn)} の本の情報が見つかりませんでした</strong><span>書名と作家名を入力すれば、このまま登録できます。</span><button class="btn" type="button" data-book="${esc(isbn)}">手入力で登録</button></div>`;
   }
   function drawResults(results) {
     const box = $("#searchResults");
@@ -739,6 +822,8 @@
       ${b.description ? `<div class="desc">${esc(b.description)}</div>` : ""}
 
       <form class="panel" id="recordForm">
+        ${b._manual || !b.title ? `<label class="field"><span>書名</span><input type="text" id="mTitle" value="${esc(b.title)}" required></label>
+        <label class="field"><span>作家名</span><input type="text" id="mAuthor" value="${esc((b.authors || []).join("、"))}" placeholder="例：豊永浩平"></label>` : ""}
         <h3>読書記録</h3>
         <div class="chips" id="statusPick" role="group" aria-label="状態">
           ${Object.entries(STATUS).map(([k, l]) => `<button class="chip" type="button" data-st="${k}" aria-pressed="${(saved ? saved.status : "") === k}">${l}</button>`).join("")}
@@ -796,7 +881,10 @@
     form.addEventListener("submit", (e) => {
       e.preventDefault();
       if (!status) status = $("#readDate").value ? "read" : "want";
-      const rec = Object.assign({}, b, {
+      const mTitle = $("#mTitle");
+      if (mTitle && !mTitle.value.trim()) { mTitle.focus(); toast("書名を入力してください"); return; }
+      const manual = mTitle ? { title: mTitle.value.trim().normalize("NFKC"), authors: normalizeAuthors($("#mAuthor").value.split(/[、,，]/)) } : {};
+      const rec = Object.assign({}, b, manual, {
         status,
         readDate: $("#readDate").value,
         genre: $("#genre").value,
@@ -804,6 +892,7 @@
         comment: $("#comment").value.trim(),
       });
       if (rec.status === "read" && !rec.readDate) rec.readDate = today();
+      delete rec._manual;
       upsertBook(rec);
       toast(saved ? "更新しました" : `「${rec.title}」を${STATUS[rec.status]}に登録しました`);
       closeSheet(route);
