@@ -19,6 +19,10 @@
   });
 
   let data = load();
+  // APIキーは運営者が config.js に組み込んだものを使う（以前の版で利用者が入力したキーがあればそれを優先）
+  const CONFIG = window.BOOKTIVE_CONFIG || {};
+  const googleKey = () => data.settings.googleKey || CONFIG.googleBooksApiKey || "";
+  const calilKey = () => data.settings.calilKey || CONFIG.calilAppKey || "";
   // 以前の版で姓と名が別の作家として保存された本を1人にまとめる
   function fixSplitAuthors() {
     let changed = false;
@@ -141,10 +145,10 @@
   let googleBlockedUntil = 0;
   const API = {
     async google(params) {
-      if (Date.now() < googleBlockedUntil && !data.settings.googleKey) throw new Error("google-limit");
+      if (Date.now() < googleBlockedUntil) throw new Error("google-limit");
       const u = new URL("https://www.googleapis.com/books/v1/volumes");
       Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, v));
-      if (data.settings.googleKey) u.searchParams.set("key", data.settings.googleKey);
+      if (googleKey()) u.searchParams.set("key", googleKey());
       const r = await fetch(u);
       if (r.status === 429 || r.status === 403) { googleBlockedUntil = Date.now() + 10 * 60e3; throw new Error("google-limit"); }
       if (!r.ok) throw new Error(`検索に失敗しました（${r.status}）`);
@@ -215,7 +219,7 @@
 
     async googleCategories(id) {
       const u = new URL("https://www.googleapis.com/books/v1/volumes/" + encodeURIComponent(id));
-      if (data.settings.googleKey) u.searchParams.set("key", data.settings.googleKey);
+      if (googleKey()) u.searchParams.set("key", googleKey());
       const r = await fetch(u);
       if (!r.ok) return "";
       const j = await r.json();
@@ -468,7 +472,7 @@
   const Calil = {
     searchLibraries(pref, city) {
       const u = new URL("https://api.calil.jp/library");
-      u.searchParams.set("appkey", data.settings.calilKey);
+      u.searchParams.set("appkey", calilKey());
       u.searchParams.set("pref", pref);
       if (city) u.searchParams.set("city", city);
       u.searchParams.set("format", "json");
@@ -476,7 +480,7 @@
     },
     // 蔵書・貸出状況（予約URL付き）。continue=1 の間はポーリング
     async check(isbn, systemids) {
-      const base = "https://api.calil.jp/check?format=json&appkey=" + encodeURIComponent(data.settings.calilKey);
+      const base = "https://api.calil.jp/check?format=json&appkey=" + encodeURIComponent(calilKey());
       let res = await jsonp(`${base}&isbn=${isbn}&systemid=${encodeURIComponent(systemids.join(","))}`);
       for (let i = 0; res.continue === 1 && i < 10; i++) {
         await new Promise((r) => setTimeout(r, 2000));
@@ -923,7 +927,7 @@
 
   function libBoxHtml(b) {
     if (!b.isbn) return `<p class="muted small">ISBNが分からない本のため、蔵書確認ができません。</p>`;
-    if (!data.settings.calilKey) return `<p class="muted small">カーリルのアプリケーションキーを「図書館・賞」→「設定」に登録すると、よく行く図書館の貸出状況の確認と予約ページへの移動ができます。</p>`;
+    if (!calilKey()) return `<p class="muted small">図書館の蔵書確認は準備中です。下の「カーリルで見る」から近くの図書館の所蔵を調べられます。</p>`;
     if (!data.libraries.length) return `<p class="muted small">よく行く図書館が未登録です。<a href="#more">図書館を登録する</a></p>`;
     return `<button class="btn btn-ghost" type="button" id="libCheck">登録した図書館の蔵書を確認</button><div class="lib-result" id="libResult"></div>`;
   }
@@ -1108,8 +1112,8 @@
       ? `<p class="muted small">この1年以内に発売された本（新しい順・予約受付中を含む）</p><div class="book-list">${items.map((b) => bookRow(b, dateSortKey(b._date) > today() ? `<span class="tag tag-reading">予約受付</span>` : "")).join("")}</div>`
       : `<p class="muted small">この1年以内の新刊は見つかりませんでした。</p>`)
       + (errors.length ? `<p class="st-ng small">${errors.map(esc).join("、")} の情報を取得できませんでした。</p>` : "")
-      + (Date.now() < googleBlockedUntil && !data.settings.googleKey
-        ? `<p class="muted small">いまは国立国会図書館の情報だけで表示しています。発売前（予約受付中）の本や発売直後の本は出ないことがあります。<a href="#more">設定でGoogle BooksのAPIキーを登録</a>すると表示されるようになります。</p>`
+      + (Date.now() < googleBlockedUntil
+        ? `<p class="muted small">本の情報サービスが混み合っているため、いまは国立国会図書館の情報で表示しています。発売前の本は少し時間をおいて「最新の情報に更新」を押すと表示されます。</p>`
         : "");
   }
 
@@ -1274,12 +1278,12 @@
         <div id="myLibs" style="display:grid;gap:8px"></div>
         <form class="panel" id="libForm" autocomplete="off">
           <h3>図書館を探して登録</h3>
-          ${data.settings.calilKey ? "" : `<p class="st-ng small" style="margin:0">図書館の検索・予約連携には、下の「設定」でカーリルのアプリケーションキーを登録してください。</p>`}
+          ${calilKey() ? "" : `<p class="st-ng small" style="margin:0">図書館の検索・予約連携は準備中です。</p>`}
           <div class="two">
             <label class="field"><span>都道府県</span><select id="libPref">${PREFS.map((p) => `<option ${p === "東京都" ? "selected" : ""}>${p}</option>`).join("")}</select></label>
             <label class="field"><span>市区町村（任意）</span><input type="text" id="libCity" placeholder="例：世田谷区"></label>
           </div>
-          <div><button class="btn" type="submit" ${data.settings.calilKey ? "" : "disabled"}>図書館を検索</button></div>
+          <div><button class="btn" type="submit" ${calilKey() ? "" : "disabled"}>図書館を検索</button></div>
           <div id="libSearchResult" class="lib-result"></div>
         </form>
       </section>
@@ -1297,16 +1301,6 @@
 
       <section class="section" id="settings">
         <h2>設定</h2>
-        <form class="panel" id="settingsForm" autocomplete="off">
-          <label class="field"><span>カーリル アプリケーションキー</span>
-            <input type="password" id="calilKey" value="${esc(data.settings.calilKey)}" placeholder="図書館の蔵書確認・予約連携に使います">
-          </label>
-          <p class="muted small" style="margin:0">キーは <a href="https://calil.jp/api/dashboard/" target="_blank" rel="noopener">カーリルAPIのページ</a> で無料で発行できます。</p>
-          <label class="field"><span>Google Books APIキー（任意）</span>
-            <input type="password" id="googleKey" value="${esc(data.settings.googleKey)}" placeholder="検索回数が多い場合のみ">
-          </label>
-          <div><button class="btn" type="submit">設定を保存</button></div>
-        </form>
         <div class="panel">
           <h3>データのバックアップ</h3>
           <p class="muted small" style="margin:0">記録はこの端末のブラウザに保存されています。機種変更の前にバックアップしてください。</p>
@@ -1366,14 +1360,6 @@
       if (b) location.hash = "#search/" + encodeURIComponent(b.dataset.aws);
     });
 
-    $("#settingsForm").addEventListener("submit", (e) => {
-      e.preventDefault();
-      data.settings.calilKey = $("#calilKey").value.trim();
-      data.settings.googleKey = $("#googleKey").value.trim();
-      save();
-      toast("設定を保存しました");
-      route();
-    });
     $("#exportBtn").addEventListener("click", () => {
       const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
       const a = document.createElement("a");
