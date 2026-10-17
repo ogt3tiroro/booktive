@@ -1209,7 +1209,20 @@
             <input type="file" id="importFile" accept="application/json,.json" hidden>
           </div>
         </div>
+        <div class="panel" id="migrate">
+          <h3>ほかの読書アプリから移行</h3>
+          <p class="muted small" style="margin:0">ビブリアなどで書き出したCSV・テキストファイルを選ぶか、共有した内容をそのまま貼り付けてください。ISBNが入っていれば、書名や表紙は自動で補います。</p>
+          <div class="row">
+            <label class="btn btn-plain" for="migrateFile">ファイルを選ぶ</label>
+            <input type="file" id="migrateFile" accept=".csv,.tsv,.txt,text/csv,text/plain,text/tab-separated-values" hidden>
+          </div>
+          <label class="field"><span>または貼り付け</span><textarea id="migrateText" placeholder="例：&#10;タイトル,著者,ISBN,読了日,評価,メモ&#10;月ぬ走いや、馬ぬ走い,豊永浩平,9784065...,2025/01/12,4.5,おもしろかった"></textarea></label>
+          <div><button class="btn btn-ghost" type="button" id="migratePreview">内容を確認</button></div>
+          <div id="migrateResult" style="display:grid;gap:10px"></div>
+        </div>
       </section>`;
+
+    bindMigrate();
 
     drawMyLibs();
     drawAwards();
@@ -1275,6 +1288,164 @@
       } catch {
         toast("バックアップファイルを読み込めませんでした");
       }
+    });
+  }
+
+  // ===================================================================
+  // ほかの読書アプリからの移行（CSV／TSV／テキスト／ISBN一覧）
+  // ===================================================================
+  function parseDelimited(text) {
+    const firstLine = text.split(/\r?\n/).find((l) => l.trim()) || "";
+    const delim = firstLine.includes("\t") ? "\t" : (firstLine.match(/,/g) || []).length >= (firstLine.match(/;/g) || []).length ? "," : ";";
+    const rows = [];
+    let row = [], cell = "", q = false;
+    for (let i = 0; i < text.length; i++) {
+      const c = text[i];
+      if (q) {
+        if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+        else if (c === '"') q = false;
+        else cell += c;
+      } else if (c === '"' && cell === "") q = true;
+      else if (c === delim) { row.push(cell); cell = ""; }
+      else if (c === "\n" || c === "\r") {
+        if (c === "\r" && text[i + 1] === "\n") i++;
+        row.push(cell); cell = "";
+        if (row.some((x) => x.trim())) rows.push(row.map((x) => x.trim()));
+        row = [];
+      } else cell += c;
+    }
+    row.push(cell);
+    if (row.some((x) => x.trim())) rows.push(row.map((x) => x.trim()));
+    return rows;
+  }
+
+  const COLUMN_RULES = [
+    ["isbn", /isbn|jan|コード/i],
+    ["title", /タイトル|書名|題名|title|本の名前|作品/i],
+    ["author", /著者|作者|作家|author|著/i],
+    ["readDate", /読了|読んだ日|読み終|完了日|finish|date read|日付|date/i],
+    ["rating", /評価|星|rating|スコア|score|点/i],
+    ["comment", /メモ|感想|コメント|レビュー|review|note|comment/i],
+    ["status", /状態|ステータス|status|分類|棚|shelf|区分/i],
+    ["publisher", /出版|publisher/i],
+  ];
+  function detectColumns(header) {
+    const map = {};
+    header.forEach((h, i) => {
+      for (const [key, re] of COLUMN_RULES) if (!(key in map) && re.test(h)) { map[key] = i; break; }
+    });
+    return map;
+  }
+  function parseDateLoose(s) {
+    const m = String(s || "").normalize("NFKC").match(/(\d{4})\s*[\/\-.年]\s*(\d{1,2})(?:\s*[\/\-.月]\s*(\d{1,2}))?/);
+    return m ? `${m[1]}-${pad2(m[2])}${m[3] ? "-" + pad2(m[3]) : "-01"}` : "";
+  }
+  function parseRating(s) {
+    s = String(s || "").normalize("NFKC").trim();
+    if (!s) return 0;
+    if (/★/.test(s)) return Math.min(5, (s.match(/★/g) || []).length);
+    const n = parseFloat(s);
+    if (isNaN(n) || n <= 0) return 0;
+    const v = n <= 5 ? n : n <= 10 ? n / 2 : n <= 100 ? n / 20 : 5;
+    return Math.round(v * 10) / 10;
+  }
+  function parseStatus(s, readDate) {
+    s = String(s || "");
+    if (/読みたい|欲しい|ほしい|積読|積ん|未読|want|wish|to-read/i.test(s)) return "want";
+    if (/読書中|読んでる|読んでいる|途中|reading/i.test(s)) return "reading";
+    if (/読了|読んだ|済|read|finished/i.test(s)) return "read";
+    return readDate ? "read" : "want";
+  }
+
+  // 文字列から取り込み候補を作る。表形式でなければISBNの一覧として扱う
+  function parseImport(text) {
+    text = String(text || "").replace(/^\uFEFF/, "");
+    const rows = parseDelimited(text);
+    const header = rows[0] || [];
+    const map = detectColumns(header);
+    const items = [];
+    const headerIsData = header.some((h) => normalizeIsbnInput(h.replace(/^\D+/, "")));
+    if (rows.length > 1 && !headerIsData && ("title" in map || "isbn" in map)) {
+      for (const r of rows.slice(1)) {
+        const get = (k) => (k in map ? r[map[k]] || "" : "");
+        const isbn = normalizeIsbnInput(get("isbn"));
+        const title = get("title");
+        if (!isbn && !title) continue;
+        const readDate = parseDateLoose(get("readDate"));
+        items.push({
+          isbn, title,
+          authors: normalizeAuthors(get("author").split(/[／\/、;]|\s{2,}/)),
+          readDate,
+          rating: parseRating(get("rating")),
+          comment: get("comment"),
+          status: parseStatus(get("status"), readDate),
+          publisher: get("publisher"),
+        });
+      }
+      return { mode: "table", map, header, items };
+    }
+    const isbns = [...new Set((text.normalize("NFKC").match(/97[89][\d\-\s]{10,16}/g) || []).map(normalizeIsbnInput).filter(Boolean))];
+    return { mode: "isbn", items: isbns.map((isbn) => ({ isbn, title: "", authors: [], readDate: "", rating: 0, comment: "", status: "read" })) };
+  }
+
+  function bindMigrate() {
+    let parsed = null;
+    const out = $("#migrateResult");
+    const preview = (text) => {
+      parsed = parseImport(text);
+      if (!parsed.items.length) {
+        out.innerHTML = `<p class="st-ng small">本の情報を見つけられませんでした。1行目に「タイトル」「著者」「ISBN」などの見出しがある表か、ISBN（978…）の一覧を使ってください。</p>`;
+        return;
+      }
+      const labels = { isbn: "ISBN", title: "書名", author: "著者", readDate: "読了日", rating: "評価", comment: "感想", status: "状態", publisher: "出版社" };
+      const found = parsed.mode === "table" ? Object.keys(parsed.map).map((k) => labels[k]).join("・") : "ISBNのみ（書名などは自動で取得）";
+      const statusCount = { want: 0, reading: 0, read: 0 };
+      parsed.items.forEach((x) => statusCount[x.status]++);
+      out.innerHTML = `
+        <p class="small" style="margin:0"><b class="num">${parsed.items.length}</b> 冊見つかりました（読了 ${statusCount.read}・読書中 ${statusCount.reading}・読みたい ${statusCount.want}）<br><span class="muted">読み取れた項目：${esc(found)}</span></p>
+        <div class="book-list">${parsed.items.slice(0, 5).map((x) => `<div class="book-row" style="grid-template-columns:1fr auto;cursor:default"><span class="meta"><span class="t">${esc(x.title || "（ISBN " + x.isbn + "）")}</span><span class="a">${esc(x.authors.join("、"))}${x.readDate ? "・" + esc(x.readDate) : ""}</span></span><span>${tagHtml(x.status)}</span></div>`).join("")}</div>
+        ${parsed.items.length > 5 ? `<p class="muted small" style="margin:0">ほか ${parsed.items.length - 5} 冊</p>` : ""}
+        <div><button class="btn" type="button" id="migrateRun">本棚に取り込む</button></div>`;
+      $("#migrateRun").addEventListener("click", runImport);
+    };
+
+    async function runImport() {
+      const btn = $("#migrateRun");
+      btn.disabled = true;
+      let added = 0, skipped = 0, failed = 0;
+      const items = parsed.items;
+      for (let i = 0; i < items.length; i++) {
+        btn.textContent = `取り込み中… ${i + 1} / ${items.length}`;
+        const x = items[i];
+        const exists = allBooks().find((b) => (x.isbn && b.isbn === x.isbn) || (x.title && titleKey(b.title) === titleKey(x.title)));
+        if (exists) { skipped++; continue; }
+        let base = null;
+        // 書名がない、または表紙のためにISBNから本の情報を補う
+        if (x.isbn) {
+          base = await API.byIsbn(x.isbn).catch(() => null);
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        if (!base && !x.title) { failed++; continue; }
+        const book = Object.assign({ id: x.isbn || "m:" + Date.now() + "-" + i, isbn: x.isbn, title: x.title, authors: x.authors, publisher: x.publisher, publishedDate: "", thumbnail: "", description: "", pageCount: 0, genre: "" }, base || {});
+        if (x.title) book.title = x.title;
+        if (x.authors.length) book.authors = x.authors;
+        upsertBook(Object.assign(book, { status: x.status, readDate: x.readDate, rating: x.rating, comment: x.comment }));
+        added++;
+      }
+      out.innerHTML = `<p class="small" style="margin:0"><b>${added}</b> 冊を本棚に取り込みました。${skipped ? `すでに登録済みの ${skipped} 冊は飛ばしました。` : ""}${failed ? `<span class="st-ng">本の情報を取得できなかった ${failed} 冊があります。</span>` : ""}</p><div><a class="btn" href="#shelf">本棚を見る</a></div>`;
+      toast(`${added}冊を取り込みました`);
+    }
+
+    $("#migratePreview").addEventListener("click", () => preview($("#migrateText").value));
+    $("#migrateFile").addEventListener("change", async (e) => {
+      const f = e.target.files[0];
+      if (!f) return;
+      const buf = await f.arrayBuffer();
+      // UTF-8で読めなければShift_JIS（Excelで保存したCSVなど）として読む
+      let text = new TextDecoder("utf-8").decode(buf);
+      if (text.includes("\uFFFD")) { try { text = new TextDecoder("shift_jis").decode(buf); } catch {} }
+      $("#migrateText").value = text.slice(0, 200000);
+      preview(text);
     });
   }
 
