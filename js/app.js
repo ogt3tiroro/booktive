@@ -300,12 +300,24 @@
     return "";
   }
 
-  // 表紙画像の候補（Google Books → 国立国会図書館 → openBD の順に試す）
-  const coverUrls = (b) => [
-    b.thumbnail,
-    b.isbn && `https://ndlsearch.ndl.go.jp/thumbnail/${b.isbn}.jpg`,
-    b.isbn && `https://cover.openbd.jp/${b.isbn}.jpg`,
-  ].filter(Boolean);
+  function isbn13to10(i13) {
+    if (!/^978\d{10}$/.test(i13 || "")) return "";
+    const core = i13.slice(3, 12);
+    let sum = 0;
+    for (let i = 0; i < 9; i++) sum += +core[i] * (10 - i);
+    const c = (11 - (sum % 11)) % 11;
+    return core + (c === 10 ? "X" : c);
+  }
+  // 表紙画像の候補。見つからなければ次を試す
+  const coverUrls = (b) => {
+    const i10 = isbn13to10(b.isbn);
+    return [
+      b.thumbnail,
+      b.isbn && `https://ndlsearch.ndl.go.jp/thumbnail/${b.isbn}.jpg`,
+      i10 && `https://images-na.ssl-images-amazon.com/images/P/${i10}.09.LZZZZZZZ.jpg`,
+      b.isbn && `https://cover.openbd.jp/${b.isbn}.jpg`,
+    ].filter(Boolean);
+  };
 
   // カーリルAPIはJSONPで呼び出す
   function jsonp(url, timeout = 20000) {
@@ -389,7 +401,7 @@
 
   function coverHtml(b) {
     const [url, ...alts] = coverUrls(b);
-    return `<div class="cover">${url ? `<img src="${esc(url)}" data-alts="${esc(alts.join(" "))}" alt="" loading="lazy">` : ""}<div class="ph" ${url ? 'style="z-index:-1"' : ""}>${esc(b.title).slice(0, 40)}</div></div>`;
+    return `<div class="cover">${url ? `<img src="${esc(url)}" data-alts="${esc(alts.join(" "))}" alt="" loading="lazy" referrerpolicy="no-referrer">` : ""}<div class="ph" ${url ? 'style="z-index:-1"' : ""}>${esc(b.title).slice(0, 40)}</div></div>`;
   }
   // 1ピクセルなどの「画像なし」応答も失敗として扱う
   document.addEventListener("load", (e) => {
