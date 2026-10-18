@@ -149,6 +149,7 @@
       const u = new URL("https://www.googleapis.com/books/v1/volumes");
       Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, v));
       if (googleKey()) u.searchParams.set("key", googleKey());
+      u.searchParams.set("country", "JP");
       const r = await fetch(u);
       if (r.status === 429 || r.status === 403) { googleBlockedUntil = Date.now() + 10 * 60e3; throw new Error("google-limit"); }
       if (!r.ok) throw new Error(`検索に失敗しました（${r.status}）`);
