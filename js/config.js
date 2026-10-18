@@ -5,5 +5,5 @@ window.BOOKTIVE_CONFIG = {
   // Google Books API キー（本の検索・作家の新刊・予約受付中の本）
   googleBooksApiKey: "",
   // カーリル アプリケーションキー（図書館の検索・蔵書確認・予約）
-  calilAppKey: "",
+  calilAppKey: "2a1af91b95b879de09003cd3af17d8ff",
 };
