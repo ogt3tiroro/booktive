@@ -172,20 +172,55 @@
       });
     },
 
+    // 楽天ブックス・Google Books・国立国会図書館の結果をまとめ、検索語を含まない的外れな本は除く
     async search(q, field = "all") {
+      const [rakuten, google] = await Promise.all([
+        hasRakuten()
+          ? (field === "author" ? API.rakuten({ author: q, sort: "-releaseDate" })
+            : field === "title" ? API.rakuten({ title: q })
+            : Promise.all([API.rakuten({ title: q }).catch(() => []), API.rakuten({ author: q, sort: "-releaseDate" }).catch(() => [])]).then((r) => r.flat())
+          ).catch(() => [])
+          : [],
+        (async () => {
+          const query = field === "title" ? `intitle:${q}` : field === "author" ? `inauthor:"${q}"` : q;
+          const j = await API.google({ q: query, maxResults: 30, printType: "books", langRestrict: "ja" });
+          return (j.items || []).map(fromGoogle).filter((b) => b.title);
+        })().catch(() => []),
+      ]);
+      let items = mergeBooks(rakuten, google).filter((b) => matchesQuery(b, q, field));
+      if (items.length < 5) {
+        const params = field === "title" ? { title: q } : field === "author" ? { creator: q } : { any: q };
+        const ndl = await API.ndl(params).catch(() => []);
+        items = mergeBooks(items, ndl.filter((b) => matchesQuery(b, q, field)));
+      }
+      return items;
+    },
+
+    // 楽天ブックス書籍検索API（日本の新刊・予約受付中の本に強い）
+    async rakuten(params) {
+      const u = new URL("https://openapi.rakuten.co.jp/services/api/BooksBook/Search/20170404");
+      Object.entries(Object.assign({ applicationId: CONFIG.rakutenAppId, accessKey: CONFIG.rakutenAccessKey, format: "json", formatVersion: 2, hits: 30, outOfStockFlag: 1 }, params))
+        .forEach(([k, v]) => u.searchParams.set(k, v));
+      let j;
       try {
-        const query = field === "title" ? `intitle:${q}` : field === "author" ? `inauthor:"${q}"` : q;
-        const j = await API.google({ q: query, maxResults: 30, printType: "books", langRestrict: "ja" });
-        const items = (j.items || []).map(fromGoogle).filter((b) => b.title);
-        if (items.length) return items;
-      } catch {}
-      const params = field === "title" ? { title: q } : field === "author" ? { creator: q } : { any: q };
-      return API.ndl(params);
+        const r = await fetch(u);
+        if (!r.ok) throw new Error("rakuten " + r.status);
+        j = await r.json();
+      } catch (err) {
+        // ブラウザから直接呼べない場合はJSONPで再試行
+        j = await jsonp(u.toString(), 12000);
+      }
+      if (j && j.error) throw new Error("rakuten " + j.error);
+      return ((j && j.Items) || []).map((x) => fromRakuten(x.Item || x)).filter((b) => b.title);
     },
 
     async byIsbn(isbn) {
       const fromBd = await API.openbd(isbn).catch(() => null);
       if (fromBd && fromBd.title) return fromBd;
+      if (hasRakuten()) {
+        const [hit] = await API.rakuten({ isbn }).catch(() => []);
+        if (hit) return Object.assign(hit, { id: isbn, isbn });
+      }
       const fromNdlList = await API.ndl({ isbn, cnt: 5 }).catch(() => []);
       const hit = fromNdlList.find((b) => b.isbn === isbn) || fromNdlList[0];
       if (hit) return Object.assign(hit, { id: isbn, isbn });
@@ -258,6 +293,15 @@
       ]);
       if (recent) pages.push(recent);
       if (general) pages.push(general);
+      // 楽天ブックスは発売前（予約受付中）の本まで新しい順に取れる
+      if (hasRakuten()) {
+        for (const page of [1, 2]) {
+          const r = await API.rakuten({ author: name, sort: "-releaseDate", page }).catch(() => null);
+          if (!r) break;
+          pages.push(r);
+          if (r.length < 30) break;
+        }
+      }
       if (!pages.length) throw new Error("作品情報を取得できませんでした。通信状態を確認してください。");
       for (const page of pages) {
         const items = page.filter((b) => b.authors.some((a) => nameKey(a) === key));
@@ -303,6 +347,60 @@
       pageCount: v.pageCount || 0,
       genre: guessGenreFromText((v.categories || []).join(" ")),
     };
+  }
+
+  const hasRakuten = () => !!(CONFIG.rakutenAppId && CONFIG.rakutenAccessKey);
+
+  function fromRakuten(it) {
+    const isbn = normalizeIsbnInput(it.isbn || "");
+    return {
+      id: isbn || "rk:" + (it.itemUrl || it.title),
+      isbn,
+      title: [it.title, it.subTitle].filter(Boolean).join(" ").normalize("NFKC"),
+      subtitle: "",
+      authors: normalizeAuthors(String(it.author || "").split(/[\/／、]/)),
+      publisher: it.publisherName || "",
+      publishedDate: normDate(it.salesDate || ""),
+      thumbnail: (it.largeImageUrl || it.mediumImageUrl || "").replace(/^http:/, "https:").replace(/\?_ex=\d+x\d+$/, ""),
+      description: it.itemCaption || "",
+      pageCount: 0,
+      genre: genreFromRakuten(it.booksGenreId || ""),
+      series: it.seriesName || "",
+    };
+  }
+  // 楽天ブックスのジャンルID（001004 = 小説・エッセイ など）から分類を推定
+  function genreFromRakuten(id) {
+    const g = String(id).split("/")[0];
+    if (/^001001/.test(g)) return "コミック";
+    if (/^001003/.test(g)) return "絵本・児童書";
+    if (/^001004008/.test(g)) return "日本の小説";
+    if (/^001004016/.test(g)) return "エッセイ・随筆";
+    if (/^001004/.test(g)) return "日本の小説";
+    if (/^001006/.test(g)) return "ビジネス・自己啓発";
+    if (/^001008/.test(g)) return "人文・社会";
+    if (/^001012/.test(g)) return "科学・技術";
+    if (/^001(009|010|011|013|015|020)/.test(g)) return "趣味・実用";
+    return "";
+  }
+
+  // 同じ本（ISBNまたは書名＋作家）を1冊にまとめる。先に渡したものを優先
+  function mergeBooks(...lists) {
+    const out = [];
+    const seen = new Set();
+    for (const b of lists.flat()) {
+      const k1 = b.isbn, k2 = titleKey(b.title) + "|" + (b.authors || []).map(nameKey).join();
+      if ((k1 && seen.has(k1)) || seen.has(k2)) continue;
+      if (k1) seen.add(k1);
+      seen.add(k2);
+      out.push(b);
+    }
+    return out;
+  }
+  // 検索語のすべての単語が書名・作家名・出版社のどこかに含まれる本だけ残す
+  function matchesQuery(b, q, field) {
+    const norm = (x) => String(x || "").normalize("NFKC").toLowerCase().replace(/[\s・、。,.:：!！?？「」『』()（）]/g, "");
+    const hay = norm(field === "author" ? (b.authors || []).join("") : field === "title" ? b.title + b.subtitle : b.title + b.subtitle + (b.authors || []).join("") + b.publisher + (b.series || ""));
+    return String(q).normalize("NFKC").split(/[\s　]+/).filter(Boolean).every((t) => hay.includes(norm(t)));
   }
 
   function fromNdl(item) {
