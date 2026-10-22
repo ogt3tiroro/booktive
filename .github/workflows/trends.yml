@@ -1,0 +1,36 @@
+# SNSで今日話題になっている言葉を1時間ごとに集めて data/trends.json を更新する
+name: SNSの話題を更新
+
+on:
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: trends
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: 話題を取得
+        run: node scripts/fetch-trends.mjs
+        env:
+          # 任意。Threads・Instagram の人気投稿も調べるときにリポジトリの Secrets に登録する
+          THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+      - name: 変更があれば保存
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/trends.json
+          git diff --cached --quiet || (git commit -m "SNSの話題を更新" && git push)

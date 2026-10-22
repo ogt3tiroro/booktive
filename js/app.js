@@ -1676,227 +1676,94 @@
   // ===================================================================
   // SNSで今日話題になった情報
   // ===================================================================
-  // ブラウザから直接読める（登録不要・CORS対応の）公開APIだけを使う。X は公開APIがないので検索ページへのリンクのみ
+  // X・Threads・Instagram はブラウザから直接読めないため、GitHub Actions（scripts/fetch-trends.mjs）が
+  // 1時間ごとに集めた data/trends.json を読む
   const SNS = {
-    bluesky: { label: "Bluesky", fetch: fetchBluesky },
-    mastodon: { label: "Mastodon", fetch: fetchMastodon },
-    misskey: { label: "Misskey", fetch: fetchMisskey },
-    x: { label: "X（旧Twitter）", linkOnly: true },
+    x: { label: "X", search: (q) => `https://x.com/search?q=${encodeURIComponent(q)}&src=trend_click` },
+    threads: { label: "Threads", search: (q) => `https://www.threads.net/search?q=${encodeURIComponent(q.replace(/^#/, ""))}&serp_type=default` },
+    instagram: { label: "Instagram", search: (q) => `https://www.instagram.com/explore/tags/${encodeURIComponent(q.replace(/^#/, "").replace(/\s+/g, ""))}/` },
   };
-  const trendState = { sources: ["bluesky", "mastodon", "misskey"], mode: "book", sort: "score", mastodonHost: "mstdn.jp", misskeyHost: "misskey.io" };
-  try { Object.assign(trendState, JSON.parse(localStorage.getItem("booktive:trendState") || "{}")); } catch {}
-  const trendCache = new Map(); // "source|mode|host" -> { at, items }
-  const TREND_TTL = 10 * 60 * 1000;
+  const trendState = { sources: Object.keys(SNS), sort: "score" };
+  try {
+    const saved = JSON.parse(localStorage.getItem("booktive:trendState") || "{}");
+    if (Array.isArray(saved.sources)) saved.sources = saved.sources.filter((k) => SNS[k]);
+    Object.assign(trendState, saved);
+  } catch {}
+  let trendData = null, trendLoadedAt = 0;
 
   const fmtN = (n) => (+n || 0).toLocaleString("ja-JP");
-  const startOfToday = () => { const d = new Date(); d.setHours(0, 0, 0, 0); return d; };
-  const isToday = (iso) => iso && new Date(iso) >= startOfToday();
-  const hoursSince = (iso) => Math.max((Date.now() - new Date(iso).getTime()) / 3600000, 0.25);
-  function agoText(iso) {
-    if (!iso) return "";
-    const m = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
-    return m < 60 ? `${Math.max(m, 1)}分前` : `${Math.floor(m / 60)}時間前`;
+  const hm = (t) => new Date(t).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" });
+  function agoText(t) {
+    const m = Math.round((Date.now() - new Date(t).getTime()) / 60000);
+    return m < 60 ? `${Math.max(m, 1)}分前` : m < 1440 ? `${Math.floor(m / 60)}時間前` : `${Math.floor(m / 1440)}日前`;
   }
-  const htmlToText = (html) => new DOMParser().parseFromString(`<p>${String(html || "").replace(/<br\s*\/?>|<\/p>/gi, "\n")}</p>`, "text/html").body.textContent.trim();
-  const plainHost = (s) => String(s || "").trim().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
 
-  async function getJson(url, body) {
-    const r = await fetch(url, body ? { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) } : undefined);
+  async function loadTrends(force) {
+    if (!force && trendData && Date.now() - trendLoadedAt < 5 * 60 * 1000) return trendData;
+    const r = await fetch(`data/trends.json?t=${Date.now()}`, { cache: "no-store" });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return r.json();
+    trendData = await r.json();
+    trendLoadedAt = Date.now();
+    return trendData;
   }
 
-  // --- 本に関する話題かどうか ---
-  const BOOK_RE = /読書|読了|積読|積ん読|小説|文庫|新書|新刊|書店|本屋|書籍|出版|重版|増刷|作家|著者|文学|絵本|漫画|マンガ|まんが|コミック|ラノベ|ライトノベル|単行本|図書館|直木賞|芥川賞|本屋大賞|文学賞|ミステリ|エッセイ|詩集|歌集|装丁|電子書籍|kindle|『[^』]{1,40}』|(?<![日基資根脚一二三四五六七八九十百何数0-9０-９])本(?![当気人来日社格物番部音命場質心体州土田目数件])|\b(books?|novels?|authors?|booksky|reading)\b/i;
-  // 本棚・好きな作家・受賞作の作家名も本の話題の手がかりにする
-  function knownAuthors() {
-    const set = new Set();
-    data.favAuthors.forEach((a) => set.add(a.name));
-    allBooks().forEach((b) => (b.authors || []).forEach((a) => set.add(a)));
-    (window.BOOKTIVE_AWARDS || []).forEach((r) => [...r.akutagawa, ...r.naoki].forEach(([a]) => set.add(cleanAuthor(a))));
-    return [...set].filter((n) => n.length >= 2);
-  }
-  const mentionedAuthors = (text, names) => names.filter((n) => text.includes(n));
-  const isBookish = (text, names) => BOOK_RE.test(text) || mentionedAuthors(text, names).length > 0;
-
-  // --- 各SNSから取得して共通の形に揃える ---
-  // item: { source, kind, title, text, url, author, createdAt, raw, evidence[], hints{} }
-  async function fetchBluesky(mode) {
-    const since = startOfToday().toISOString();
-    const items = [];
-    if (mode === "book") {
-      // 本にまつわる言葉で今日の人気投稿を探す
-      const words = ["読了", "新刊", "小説", "本屋"];
-      const results = await Promise.allSettled(words.map((q) => getJson(`https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?q=${encodeURIComponent(q)}&sort=top&lang=ja&since=${encodeURIComponent(since)}&limit=25`)));
-      if (results.every((r) => r.status === "rejected")) throw results[0].reason;
-      const seen = new Set();
-      results.forEach((r) => r.status === "fulfilled" && (r.value.posts || []).forEach((p) => {
-        if (seen.has(p.uri)) return;
-        seen.add(p.uri);
-        const text = p.record?.text || "";
-        items.push({
-          source: "bluesky", kind: "post", text, createdAt: p.record?.createdAt || p.indexedAt,
-          url: `https://bsky.app/profile/${p.author.handle}/post/${p.uri.split("/").pop()}`,
-          author: p.author.displayName || p.author.handle,
-          likes: p.likeCount || 0, reposts: (p.repostCount || 0) + (p.quoteCount || 0), replies: p.replyCount || 0,
-        });
-      }));
-    } else {
-      // Bluesky 公式の「トレンド」
-      const j = await getJson("https://public.api.bsky.app/xrpc/app.bsky.unspecced.getTrends?limit=25");
-      (j.trends || []).forEach((t, i) => items.push({
-        source: "bluesky", kind: "topic", title: t.displayName || t.topic, text: t.displayName || t.topic,
-        url: t.link ? "https://bsky.app" + t.link : `https://bsky.app/search?q=${encodeURIComponent(t.topic)}`,
-        createdAt: t.startedAt, uses: t.postCount || 0, status: t.status, category: t.category, rank: i + 1,
-      }));
-    }
-    return items;
+  // --- 話題度：各SNSの数字を 0〜100 にまとめる ---
+  function trendScore(t) {
+    let s = 0;
+    if (t.x) s += t.x.rank ? 60 - Math.min(t.x.rank, 50) : Math.max(25 - t.x.bestRank / 2, 5);
+    if (t.x?.hours) s += Math.min(t.x.hours, 12);
+    if (t.threads?.todayPosts) s += Math.min(t.threads.todayPosts * 2, 15);
+    if (t.instagram?.likes) s += Math.min(Math.log10(1 + t.instagram.likes) * 4, 15);
+    if (t.google) s += 8;
+    return Math.min(Math.round(s), 100);
   }
 
-  async function fetchMastodon(mode) {
-    const host = plainHost(trendState.mastodonHost) || "mstdn.jp";
-    const base = `https://${host}/api/v1/trends`;
-    const [st, tags, links] = await Promise.allSettled([getJson(`${base}/statuses?limit=40`), getJson(`${base}/tags?limit=20`), getJson(`${base}/links?limit=20`)]);
-    if ([st, tags, links].every((r) => r.status === "rejected")) throw st.reason;
-    const items = [];
-    if (st.status === "fulfilled") st.value.forEach((s, i) => {
-      const text = (s.spoiler_text ? s.spoiler_text + "\n" : "") + htmlToText(s.content);
-      items.push({
-        source: "mastodon", kind: "post", text, createdAt: s.created_at, url: s.url || s.uri,
-        author: s.account?.display_name || s.account?.acct, likes: s.favourites_count || 0, reposts: s.reblogs_count || 0, replies: s.replies_count || 0, rank: i + 1, host,
-      });
-    });
-    if (tags.status === "fulfilled") tags.value.forEach((t, i) => {
-      const [today = {}, yesterday = {}] = t.history || [];
-      items.push({
-        source: "mastodon", kind: "tag", title: "#" + t.name, text: t.name, url: t.url, createdAt: new Date().toISOString(),
-        uses: +today.uses || 0, accounts: +today.accounts || 0, prevUses: +yesterday.uses || 0, rank: i + 1, host,
-      });
-    });
-    if (links.status === "fulfilled") links.value.forEach((l, i) => {
-      const [today = {}, yesterday = {}] = l.history || [];
-      items.push({
-        source: "mastodon", kind: "link", title: l.title, text: `${l.title}\n${l.description || ""}`, url: l.url, author: l.provider_name,
-        createdAt: l.published_at || new Date().toISOString(), uses: +today.uses || 0, accounts: +today.accounts || 0, prevUses: +yesterday.uses || 0, rank: i + 1, host,
-      });
-    });
-    // 投稿は今日のものだけ（ハッシュタグ・記事は今日の利用数で判断）
-    return items.filter((it) => it.kind !== "post" || isToday(it.createdAt)).filter((it) => it.kind === "post" || it.uses > 0);
-  }
-
-  async function fetchMisskey(mode) {
-    const host = plainHost(trendState.misskeyHost) || "misskey.io";
-    const [notes, tags] = await Promise.allSettled([getJson(`https://${host}/api/notes/featured`, { limit: 30 }), getJson(`https://${host}/api/hashtags/trend`, {})]);
-    if (notes.status === "rejected" && tags.status === "rejected") throw notes.reason;
-    const items = [];
-    if (notes.status === "fulfilled") notes.value.forEach((n, i) => {
-      const reactions = n.reactionCount ?? Object.values(n.reactions || {}).reduce((a, b) => a + b, 0);
-      items.push({
-        source: "misskey", kind: "post", text: [n.cw, n.text].filter(Boolean).join("\n"), createdAt: n.createdAt, url: `https://${host}/notes/${n.id}`,
-        author: n.user?.name || n.user?.username, likes: reactions, reposts: n.renoteCount || 0, replies: n.repliesCount || 0, rank: i + 1, host,
-      });
-    });
-    if (tags.status === "fulfilled") tags.value.forEach((t, i) => {
-      const chart = t.chart || [];
-      const half = Math.floor(chart.length / 2);
-      const avg = (a) => a.length ? a.reduce((x, y) => x + y, 0) / a.length : 0;
-      items.push({
-        source: "misskey", kind: "tag", title: "#" + t.tag, text: t.tag, url: `https://${host}/tags/${encodeURIComponent(t.tag)}`, createdAt: new Date().toISOString(),
-        accounts: t.usersCount || 0, uses: chart.reduce((a, b) => a + b, 0), rising: half > 0 && avg(chart.slice(half)) > avg(chart.slice(0, half)) * 1.5, rank: i + 1, host,
-      });
-    });
-    return items.filter((it) => it.kind !== "post" || isToday(it.createdAt));
-  }
-
-  async function loadSource(key, mode, force) {
-    const host = key === "mastodon" ? trendState.mastodonHost : key === "misskey" ? trendState.misskeyHost : "";
-    const ck = `${key}|${mode}|${host}`;
-    const hit = trendCache.get(ck);
-    if (!force && hit && Date.now() - hit.at < TREND_TTL) return hit.items;
-    const items = await SNS[key].fetch(mode);
-    trendCache.set(ck, { at: Date.now(), items });
-    return items;
-  }
-
-  // --- 話題の根拠（数値）と想定される理由（推定）---
-  const engagement = (it) => it.kind === "post" ? it.likes + it.reposts * 2 + it.replies * 1.5 : (it.accounts || 0) * 3 + (it.uses || 0) || Math.max(30 - (it.rank || 30), 1);
-
+  // --- 想定される理由（言葉・ニュース・時間帯からの推定）---
   const REASONS = [
-    [/芥川賞|直木賞/, "芥川賞・直木賞の候補作や受賞作の発表・話題に関連している"],
-    [/本屋大賞|文学賞|大賞|受賞|ノミネート|候補作|ランキング|第\d+回/, "賞の受賞・ノミネートやランキングの発表があった"],
-    [/映画化|ドラマ化|アニメ化|実写化|映像化|舞台化|ミュージカル化|放送|地上波|配信開始|公開|主演|キャスト/, "映像化・放送・配信の発表があり、原作や関連作品に注目が集まった"],
-    [/新刊|発売|刊行|予約|発売日|書き下ろし|最新刊|続編|シリーズ最新/, "新刊の発売・予約開始など新しい作品の情報が出た"],
-    [/重版|増刷|完売|売り切れ|品切れ|在庫|入荷|売れて/, "売れ行きが好調で、重版・品薄などの情報が広まった"],
-    [/訃報|死去|亡くな|逝去|ご冥福|追悼/, "訃報が伝えられ、追悼や作品を振り返る投稿が増えた"],
-    [/炎上|批判|謝罪|物議|賛否|問題視|撤回/, "賛否を呼ぶ出来事があり、意見を交わす投稿が増えた"],
-    [/セール|無料|半額|割引|ポイント|kindle|キャンペーン|期間限定/i, "セールや無料公開などのお得な情報が共有された"],
-    [/読了|感想|レビュー|面白|泣いた|最高|おすすめ|オススメ|刺さ/, "読んだ感想やおすすめが共感を呼び、共有された"],
-    [/(書店|本屋|図書館).{0,15}(閉店|開店|オープン|移転|休館)|(閉店|開店|オープン|移転|休館).{0,15}(書店|本屋|図書館)/, "書店や図書館の開店・閉店などの話題があった"],
-    [/誕生日|生誕|周年|記念日|命日|本の日|読書週間|読書の秋/, "季節・記念日・周年など、その時期にちなんだ話題"],
-    [/サイン会|イベント|フェア|展示|トーク|講演|コラボ/, "イベント・フェア・コラボの告知や開催があった"],
-    [/速報|発表|決定|判明|ニュース|報道/, "新しい発表・ニュースが出た直後で、情報が急速に広まった"],
-    [/地震|台風|大雨|警報|災害|停電|避難/, "災害・気象に関する情報で、注意喚起として広く共有された"],
-    [/試合|優勝|勝利|選手|ゴール|W杯|五輪|リーグ/, "スポーツの試合・結果に関する話題"],
+    [/訃報|死去|亡くな|逝去|ご冥福|追悼/, "訃報が伝えられ、追悼の投稿が集まった"],
+    [/地震|津波|台風|大雨|豪雨|大雪|警報|災害|停電|避難|噴火/, "災害・気象の情報で、安否確認や注意喚起として広く共有された"],
+    [/事故|事件|逮捕|容疑|火災|運転見合わせ|遅延|運休|障害|不具合|つながらない|ログインできない/, "事件・事故・交通やサービスの障害が起き、状況を確認する投稿が増えた"],
+    [/炎上|批判|謝罪|物議|賛否|問題視|撤回|不倫|騒動/, "賛否を呼ぶ出来事があり、意見を交わす投稿が増えた"],
+    [/結婚|入籍|離婚|熱愛|妊娠|出産|卒業|脱退|引退|活動休止|復帰/, "有名人の結婚・引退などの発表があった"],
+    [/優勝|勝利|敗退|決勝|試合|選手(?!権)|ホームラン|本塁打|ゴール|代表|W杯|五輪|オリンピック|リーグ|シリーズ|ドラフト|移籍|監督/, "スポーツの試合・結果・選手の話題で盛り上がった"],
+    [/ロードショー|ドラマ|アニメ|映画|放送|地上波|最終回|第\d+話|実況|紅白|生放送|ライブ|配信|出演|MV|新曲/, "テレビ番組・配信・ライブの放送や公開にあわせて、実況や感想が投稿された"],
+    [/発売|新作|新商品|予約|解禁|発表|公開|情報解禁|決定|リリース|コラボ|限定/, "新しい商品・作品・コラボなどの発表があった"],
+    [/選挙|首相|総理|大臣|政府|国会|内閣|法案|与党|野党|増税|減税|給付/, "政治・政策のニュースが出て、意見を交わす投稿が増えた"],
+    [/株|円安|円高|値上げ|値下げ|物価|日経平均|為替/, "経済・物価のニュースが出て、関心が集まった"],
+    [/誕生祭|生誕祭|生誕|誕生日|おめでとう|周年|記念日|の日$/, "誕生日・記念日・周年を祝う投稿が集まった"],
+    [/セール|無料|半額|割引|ポイント|キャンペーン|プレゼント|当選/, "セールやキャンペーンなどのお得な情報が共有された"],
+    [/選手権|見た人|好きな|晒す|RT|いいね|あなたの|自分の|やってみた|診断|大喜利/i, "参加型のハッシュタグ企画（診断・大喜利など）に多くの人が参加した"],
   ];
-  // 時期による話題（読書週間・文学賞の発表時期）
-  function seasonalReason(text) {
-    const d = new Date(), m = d.getMonth() + 1, day = d.getDate();
-    if (((m === 10 && day >= 27) || (m === 11 && day <= 9)) && /読書|本/.test(text)) return "読書週間（10月27日〜11月9日）中で、読書に関する投稿が増える時期";
-    if ((m === 1 || m === 7) && day >= 10 && day <= 25 && /芥川|直木/.test(text)) return "芥川賞・直木賞の選考会が行われる時期";
-    if (m === 4 && /本屋大賞/.test(text)) return "本屋大賞の発表時期";
-    return "";
-  }
 
-  function explain(it, names, crossMap) {
-    const ev = [];
-    if (it.kind === "post") {
-      const parts = [];
-      if (it.likes) parts.push(`${it.source === "misskey" ? "リアクション" : "いいね"} ${fmtN(it.likes)}`);
-      if (it.reposts) parts.push(`${it.source === "bluesky" ? "リポスト・引用" : it.source === "misskey" ? "リノート" : "ブースト"} ${fmtN(it.reposts)}`);
-      if (it.replies) parts.push(`返信 ${fmtN(it.replies)}`);
-      if (parts.length) ev.push(parts.join("・"));
-      const perHour = engagement(it) / hoursSince(it.createdAt);
-      if (perHour >= 1) ev.push(`投稿から${agoText(it.createdAt).replace("前", "")}で、1時間あたり約${fmtN(Math.round(perHour))}件の反応`);
-    } else {
-      if (it.uses) ev.push(it.kind === "topic" ? `関連投稿 約${fmtN(it.uses)}件` : `${it.source === "misskey" ? "直近" : "今日"}の投稿 ${fmtN(it.uses)}件${it.accounts ? `（${fmtN(it.accounts)}人）` : ""}`);
-      else if (it.accounts) ev.push(`利用者 ${fmtN(it.accounts)}人`);
-      if (it.prevUses != null && it.uses) {
-        if (!it.prevUses) ev.push("昨日はほとんど使われておらず、今日になって急に広まった");
-        else if (it.uses / it.prevUses >= 1.5) ev.push(`昨日（${fmtN(it.prevUses)}件）の${(it.uses / it.prevUses).toFixed(1)}倍に増加`);
-      }
-      if (it.rising) ev.push("直近の投稿数が増加中");
-      if (it.status === "hot") ev.push("Bluesky で「急上昇」と表示");
-      if (it.kind === "topic" && it.createdAt) ev.push(`${agoText(it.createdAt)}から話題に`);
+  function explainTrend(t) {
+    const ev = [], reasons = [];
+    // 話題の根拠（各SNSの数字）
+    if (t.x) {
+      ev.push(t.x.rank ? `X のトレンド 現在 ${t.x.rank}位${t.x.bestRank < t.x.rank ? `（今日の最高 ${t.x.bestRank}位）` : ""}` : `X のトレンド 今日の最高 ${t.x.bestRank}位（現在は圏外）`);
+      if (t.x.count) ev.push(`X のポスト数 約${fmtN(t.x.count)}件`);
+      if (t.x.firstAt) ev.push(`今日 ${hm(t.x.firstAt)}ごろにトレンド入りし、${t.x.hours}時間ランクイン`);
+      const r = t.x.ranks || [];
+      if (r.length >= 2 && r[0][1] - r[r.length - 1][1] >= 10) ev.push(`順位が ${r[0][1]}位 → ${r[r.length - 1][1]}位 に上昇`);
     }
-    const where = `${SNS[it.source].label}${it.host ? `（${it.host}）` : ""}`;
-    if (it.source === "bluesky" && it.kind === "post") ev.push("Bluesky の今日の人気投稿（検索結果の上位）");
-    else if (it.rank) ev.push(`${where}の${it.kind === "post" ? "注目の投稿" : "トレンド"} ${it.rank}位`);
-    const others = [...new Set((it.keys || []).flatMap((k) => (crossMap.get(k) || []).filter((s) => s !== it.source)))];
-    if (others.length) ev.push(`${others.map((s) => SNS[s].label).join("・")}でも同じ話題が出ている`);
+    if (t.threads) ev.push(t.threads.todayPosts ? `Threads で今日の人気投稿 ${t.threads.todayPosts}件` : "Threads の人気投稿に今日の投稿はなし");
+    if (t.instagram) ev.push(`Instagram の人気投稿（#${t.name.replace(/^#/, "")}）いいね合計 ${fmtN(t.instagram.likes)}・コメント ${fmtN(t.instagram.comments)}`);
+    if (t.google) ev.push(`Google 検索でも急上昇${t.google.traffic ? `（${t.google.traffic.replace(/\+$/, "")}回以上の検索）` : ""}`);
+    const on = ["x", "threads", "instagram"].filter((k) => k === "threads" ? t.threads?.todayPosts : t[k]);
+    if (on.length >= 2) ev.push(`${on.map((k) => SNS[k].label).join("・")}の${on.length}つのSNSで話題`);
 
-    const text = `${it.title || ""}\n${it.text || ""}`;
-    const reasons = REASONS.filter(([re]) => re.test(text)).map(([, r]) => r).slice(0, 3);
-    const season = seasonalReason(text);
-    if (season) reasons.push(season);
-    const authors = mentionedAuthors(text, names);
-    if (authors.length) reasons.push(`作家「${authors.slice(0, 2).join("」「")}」に関する話題（本棚・好きな作家・受賞作の作家）`);
-    // 反応の内訳から読み取れる傾向
-    if (it.kind === "post") {
-      const total = it.likes + it.reposts + it.replies;
-      if (total >= 10 && it.reposts / total >= 0.4) reasons.push("共有（リポスト）の割合が高く、人に知らせたくなる情報として拡散した");
-      else if (total >= 10 && it.replies / total >= 0.3) reasons.push("返信の割合が高く、意見交換や議論が活発になった");
+    // 想定される理由
+    const news = t.google?.news || [];
+    news.slice(0, 2).forEach((n) => reasons.push(`ニュース「${n.title}」${n.source ? `（${n.source}）` : ""}が報じられた`));
+    // 個々の投稿は話題と関係ない内容も多いので、言葉そのものとニュースの見出しだけで推定する
+    const text = [t.name, ...news.map((n) => n.title)].join("\n");
+    REASONS.forEach(([re, r]) => { if (reasons.length < 4 && re.test(text)) reasons.push(r); });
+    if (!news.length && t.x?.firstAt) {
+      const h = new Date(t.x.firstAt).getHours();
+      if (/^#/.test(t.name) && h >= 19 && h <= 23 && !reasons.some((r) => r.includes("放送"))) reasons.push("夜の放送時間帯にトレンド入りしており、テレビ番組や配信の実況の可能性");
     }
-    if (!reasons.length) reasons.push(it.kind === "post" ? "多くの人が反応した投稿（本文からは具体的なきっかけを特定できませんでした）" : "多くの人が同じ話題を投稿している（きっかけはリンク先で確認してください）");
-    return { evidence: ev, reasons: [...new Set(reasons)] };
-  }
-
-  // 同じ話題が複数のSNSに出ているかを調べるためのキー（ハッシュタグと『作品名』）
-  function topicKeys(it) {
-    const t = `${it.title || ""} ${it.text || ""}`.normalize("NFKC");
-    const keys = [...t.matchAll(/#([^\s#、。,.!?！？「」『』()（）]+)/g)].map((m) => m[1].toLowerCase());
-    if (it.kind === "tag" || it.kind === "topic") keys.push(String(it.text).replace(/^#/, "").toLowerCase());
-    [...t.matchAll(/『([^』]{1,40})』/g)].forEach((m) => keys.push(titleKey(m[1])));
-    return [...new Set(keys.filter((k) => k.length >= 2))];
+    if (t.x && t.x.hours <= 2 && t.x.rank && t.x.rank <= 10) reasons.push("短時間で上位に入っており、新しい出来事が起きた直後の可能性");
+    if (!reasons.length) reasons.push("多くの人が同じ言葉で投稿している（きっかけは各SNSの投稿で確認してください）");
+    return { evidence: ev, reasons: [...new Set(reasons)].slice(0, 4) };
   }
 
   // --- 画面 ---
@@ -1912,25 +1779,16 @@
             </div>
           </div>
           <div class="row">
-            <div class="seg" role="group" aria-label="話題の種類">
-              ${[["book", "本の話題"], ["all", "すべての話題"]].map(([k, l]) => `<button type="button" data-mode="${k}" aria-pressed="${trendState.mode === k}">${l}</button>`).join("")}
+            <span class="muted small">並び順</span>
+            <div class="seg" role="group" aria-label="並び順">
+              ${[["score", "話題度順"], ["new", "新しく話題になった順"]].map(([k, l]) => `<button type="button" data-tsort="${k}" aria-pressed="${trendState.sort === k}">${l}</button>`).join("")}
             </div>
-            <select id="trendSort" aria-label="並び順" style="width:auto"><option value="score">話題度順</option><option value="new">新しい順</option></select>
           </div>
-          <details class="small">
-            <summary class="muted">Mastodon・Misskey のサーバーを変更</summary>
-            <div class="two" style="margin-top:8px">
-              <label class="field"><span>Mastodon</span><input type="text" id="mastodonHost" value="${esc(trendState.mastodonHost)}" placeholder="mstdn.jp"></label>
-              <label class="field"><span>Misskey</span><input type="text" id="misskeyHost" value="${esc(trendState.misskeyHost)}" placeholder="misskey.io"></label>
-            </div>
-          </details>
         </div>
-        <p class="muted small" style="margin:0">「話題の根拠」は各SNSが公開している反応数やトレンド順位です。「想定される理由」は投稿の言葉と反応の傾向から推定したもので、事実と異なる場合があります。</p>
+        <p class="muted small" style="margin:0">「話題の根拠」は各SNSのトレンド順位・投稿数などの数字です。「想定される理由」は関連ニュースや言葉・時間帯から推定したもので、事実と異なる場合があります。</p>
         <div id="trendStatus" class="small"></div>
         <div id="trendList" style="display:grid;gap:12px"></div>
       </section>`;
-    $("#trendSort").value = trendState.sort;
-
     const persist = () => { try { localStorage.setItem("booktive:trendState", JSON.stringify(trendState)); } catch {} };
     $("#snsChips").addEventListener("click", (e) => {
       const b = e.target.closest("[data-sns]"); if (!b) return;
@@ -1939,96 +1797,69 @@
       b.setAttribute("aria-pressed", trendState.sources.includes(k));
       persist(); drawTrends();
     });
-    $$("[data-mode]").forEach((b) => b.addEventListener("click", () => {
-      trendState.mode = b.dataset.mode; persist();
-      $$("[data-mode]").forEach((x) => x.setAttribute("aria-pressed", x === b));
+    $$("[data-tsort]").forEach((b) => b.addEventListener("click", () => {
+      trendState.sort = b.dataset.tsort; persist();
+      $$("[data-tsort]").forEach((x) => x.setAttribute("aria-pressed", x === b));
       drawTrends();
     }));
-    $("#trendSort").addEventListener("change", (e) => { trendState.sort = e.target.value; persist(); drawTrends(); });
-    ["mastodonHost", "misskeyHost"].forEach((id) => $("#" + id).addEventListener("change", (e) => { trendState[id] = plainHost(e.target.value) || e.target.placeholder; e.target.value = trendState[id]; persist(); drawTrends(); }));
     $("#trendRefresh").addEventListener("click", () => drawTrends(true));
     drawTrends();
   }
 
-  let trendSeq = 0;
   async function drawTrends(force = false) {
     const list = $("#trendList"), status = $("#trendStatus");
     if (!list) return;
-    const seq = ++trendSeq;
-    const mode = trendState.mode;
-    const keys = trendState.sources.filter((k) => !SNS[k].linkOnly);
-    const xCard = trendState.sources.includes("x") ? xLinksHtml(mode) : "";
-    if (!trendState.sources.length) { status.innerHTML = ""; list.innerHTML = `<div class="empty">対象のSNSを1つ以上選んでください。</div>`; return; }
-    list.innerHTML = xCard + (keys.length ? `<div class="spinner" role="progressbar" aria-label="読み込み中"></div>` : "");
-    status.innerHTML = "";
-    if (!keys.length) return;
+    const sel = trendState.sources;
+    if (!sel.length) { status.innerHTML = ""; list.innerHTML = `<div class="empty">対象のSNSを1つ以上選んでください。</div>`; return; }
+    list.innerHTML = `<div class="spinner" role="progressbar" aria-label="読み込み中"></div>`;
+    let d;
+    try { d = await loadTrends(force); } catch { list.innerHTML = `<div class="empty">話題のデータを読み込めませんでした。通信状態を確認して更新してください。</div>`; return; }
+    if (!$("#trendList")) return;
+    const src = d.sources || {};
+    const has = (t, k) => k === "threads" ? t.threads?.todayPosts > 0 : !!t[k];
+    // 選んだSNSのどれかで話題になっているもの
+    let topics = (d.topics || []).filter((t) => sel.some((k) => has(t, k)));
+    const noData = sel.filter((k) => !src[k]?.ok);
+    let fallback = false;
+    if (!topics.length && d.topics?.length) { topics = d.topics; fallback = true; }
+    topics = topics.map((t) => ({ ...t, score: trendScore(t) }));
+    topics.sort(trendState.sort === "new"
+      ? (a, b) => (b.x?.firstAt || b.google?.startedAt || 0) - (a.x?.firstAt || a.google?.startedAt || 0)
+      : (a, b) => b.score - a.score);
 
-    const results = await Promise.allSettled(keys.map((k) => loadSource(k, mode, force)));
-    if (seq !== trendSeq) return; // 途中で条件が変わった
-    const names = knownAuthors();
-    const counts = [];
-    let items = [];
-    results.forEach((r, i) => {
-      const k = keys[i];
-      if (r.status === "rejected") { counts.push(`<span class="st-ng">${SNS[k].label}：取得できませんでした</span>`); return; }
-      let got = r.value;
-      if (mode === "book") got = got.filter((it) => isBookish(`${it.title || ""}\n${it.text || ""}`, names));
-      // SNSごとに話題度を 0〜100 にそろえて、異なるSNSを同じ並びで比べられるようにする
-      const max = Math.max(...got.map((it) => Math.log10(1 + engagement(it))), 1);
-      got.forEach((it) => { it.score = Math.round((Math.log10(1 + engagement(it)) / max) * 100); it.keys = topicKeys(it); });
-      counts.push(`<span>${SNS[k].label}：${got.length}件</span>`);
-      items = items.concat(got);
-    });
-    const crossMap = new Map();
-    items.forEach((it) => it.keys.forEach((k) => crossMap.set(k, [...new Set([...(crossMap.get(k) || []), it.source])])));
-    items.forEach((it) => { if (it.keys.some((k) => (crossMap.get(k) || []).length > 1)) it.score = Math.min(100, it.score + 10); });
-    items.sort(trendState.sort === "new" ? (a, b) => new Date(b.createdAt) - new Date(a.createdAt) : (a, b) => b.score - a.score);
-    items = items.slice(0, 40);
+    const notes = [];
+    if (d.updatedAt) notes.push(`<span>${hm(d.updatedAt)} 更新（${agoText(d.updatedAt)}）</span>`);
+    sel.forEach((k) => notes.push(src[k]?.ok
+      ? `<span>${SNS[k].label}：${(d.topics || []).filter((t) => has(t, k)).length}件</span>`
+      : `<span class="st-ng">${SNS[k].label}：データなし</span>`));
+    const why = noData.filter((k) => k !== "x").length
+      ? `<p class="muted small" style="margin:4px 0 0">${noData.filter((k) => k !== "x").map((k) => SNS[k].label).join("・")} はトレンドを公開していないため、運営者が公式APIのキーを登録したときだけ投稿数などを調べます。未登録の間は、各話題の「${noData.filter((k) => k !== "x").map((k) => SNS[k].label).join("・")}で見る」から確認できます。</p>` : "";
+    status.innerHTML = `<div class="row muted">${notes.join(`<span aria-hidden="true">／</span>`)}</div>${why}`;
 
-    status.innerHTML = `<div class="row muted">${counts.join(`<span aria-hidden="true">／</span>`)}<span>・${new Date().toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit" })} 時点</span></div>`;
-    list.innerHTML = xCard + (items.length
-      ? items.map((it) => trendCardHtml(it, explain(it, names, crossMap))).join("")
-      : `<div class="empty">${mode === "book" ? "今日の本に関する話題は見つかりませんでした。「すべての話題」に切り替えると一般の話題を表示します。" : "今日の話題を取得できませんでした。時間をおいて更新してください。"}</div>`);
+    if (!d.updatedAt || !(d.topics || []).length) { list.innerHTML = `<div class="empty">まだ話題のデータがありません。1時間ごとに自動で更新されます。</div>`; return; }
+    list.innerHTML = (fallback ? `<p class="small" style="margin:0">選んだSNSの数字は取れなかったため、ほかのSNSで話題の言葉を表示しています。</p>` : "")
+      + topics.map((t, i) => trendCardHtml(t, i + 1, explainTrend(t), sel)).join("");
   }
 
-  const KIND_LABEL = { post: "投稿", tag: "ハッシュタグ", link: "記事", topic: "トレンド" };
-  function trendCardHtml(it, { evidence, reasons }) {
-    const title = it.title || (it.text || "").replace(/\s+/g, " ").slice(0, 140) + ((it.text || "").length > 140 ? "…" : "");
-    const book = ((it.text || "").match(/『([^』]{1,40})』/) || [])[1];
+  function trendCardHtml(t, no, { evidence, reasons }, sel) {
+    const badges = Object.keys(SNS).filter((k) => k === "threads" ? t.threads?.todayPosts : t[k]).map((k) => `<span class="sns-badge sns-${k}">${SNS[k].label}</span>`).join("");
+    const posts = [...(t.threads?.posts || []).map((p) => ["threads", p]), ...(t.instagram?.posts || []).map((p) => ["instagram", p])].filter(([, p]) => p.text).slice(0, 2);
     return `
       <article class="trend">
         <div class="trend-head">
-          <span class="sns-badge sns-${it.source}">${SNS[it.source].label}</span>
-          <span class="tag tag-want">${KIND_LABEL[it.kind]}</span>
-          ${it.createdAt && it.kind !== "tag" ? `<span class="muted small">${agoText(it.createdAt)}</span>` : ""}
-          <span class="trend-score" aria-label="話題度 ${it.score}"><span class="progress"><i style="width:${it.score}%"></i></span><b class="num">${it.score}</b></span>
+          <span class="trend-no num">${no}</span>
+          ${badges}
+          <span class="trend-score" aria-label="話題度 ${t.score}"><span class="progress"><i style="width:${t.score}%"></i></span><b class="num">${t.score}</b></span>
         </div>
-        <h3 class="trend-title">${esc(title)}</h3>
-        ${it.author ? `<p class="muted small" style="margin:0">${esc(it.author)}</p>` : ""}
+        <h3 class="trend-title">${esc(t.name)}</h3>
         <div class="trend-why">
           <div><h4>話題の根拠</h4><ul>${evidence.map((e) => `<li>${esc(e)}</li>`).join("")}</ul></div>
           <div><h4>想定される理由<span class="muted">（推定）</span></h4><ul>${reasons.map((r) => `<li>${esc(r)}</li>`).join("")}</ul></div>
         </div>
+        ${posts.length ? `<div class="trend-posts">${posts.map(([k, p]) => `<a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer"><span class="muted">${SNS[k].label}${p.user ? " @" + esc(p.user) : ""}</span> ${esc(p.text.replace(/\s+/g, " ").slice(0, 90))}</a>`).join("")}</div>` : ""}
         <div class="row">
-          <a class="btn btn-sm btn-plain" href="${esc(it.url)}" target="_blank" rel="noopener noreferrer">${SNS[it.source].label}で見る</a>
-          ${book ? `<a class="btn btn-sm btn-ghost" href="#search/${encodeURIComponent(book)}">『${esc(book)}』を探す</a>` : ""}
-        </div>
-      </article>`;
-  }
-
-  // X は公開APIがないため、今日の投稿に絞った検索ページを開く
-  function xLinksHtml(mode) {
-    const since = `since:${today()}`;
-    const links = mode === "book"
-      ? [["本・読書の人気投稿", `(読了 OR 新刊 OR 小説 OR 本屋) min_faves:300 lang:ja ${since}`], ["#読了 の人気投稿", `#読了 min_faves:100 ${since}`], ["作家・文学賞の話題", `(作家 OR 文学賞 OR 重版 OR 映像化) min_faves:300 lang:ja ${since}`]]
-      : [["今日の人気投稿", `min_faves:5000 lang:ja ${since}`]];
-    return `
-      <article class="trend">
-        <div class="trend-head"><span class="sns-badge sns-x">X</span><span class="muted small">外部サイトで開きます</span></div>
-        <p class="small" style="margin:0">X は外部アプリから読める公開データがないため、この画面に一覧を表示できません。今日の投稿に絞った検索結果を X で開けます（いいね数の多い順の目安で絞り込み済み）。</p>
-        <div class="row">
-          ${links.map(([l, q]) => `<a class="btn btn-sm btn-plain" href="https://x.com/search?q=${encodeURIComponent(q)}&f=top" target="_blank" rel="noopener noreferrer">${esc(l)}</a>`).join("")}
-          ${mode === "all" ? `<a class="btn btn-sm btn-plain" href="https://x.com/explore/tabs/trending" target="_blank" rel="noopener noreferrer">X のトレンド</a>` : ""}
+          ${sel.map((k) => `<a class="btn btn-sm btn-plain" href="${esc(t[k]?.url || SNS[k].search(t.name))}" target="_blank" rel="noopener noreferrer">${SNS[k].label}で見る</a>`).join("")}
+          ${t.google?.news?.[0]?.url ? `<a class="btn btn-sm btn-ghost" href="${esc(t.google.news[0].url)}" target="_blank" rel="noopener noreferrer">関連ニュース</a>` : ""}
         </div>
       </article>`;
   }

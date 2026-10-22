@@ -249,7 +249,7 @@ input[type="date"]::-webkit-date-and-time-value { text-align: left; }
 /* --- SNSの話題 --- */
 .trend { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; display: grid; gap: 8px; min-width: 0; }
 .trend-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.trend-title { font: 500 1.02rem/1.55 var(--f-title); overflow-wrap: anywhere; white-space: pre-line; }
+.trend-title { font: 700 1.15rem/1.5 var(--f-title); overflow-wrap: anywhere; white-space: pre-line; }
 .trend-score { margin-left: auto; display: inline-flex; align-items: center; gap: 6px; font-size: .88rem; }
 .trend-score .progress { width: 64px; height: 6px; }
 .trend-score b { min-width: 2ch; text-align: right; }
@@ -259,9 +259,11 @@ input[type="date"]::-webkit-date-and-time-value { text-align: left; }
 .trend-why li + li { margin-top: 2px; }
 @media (max-width: 560px) { .trend-why { grid-template-columns: 1fr; } }
 .sns-badge { font-size: .82rem; font-weight: 700; padding: 1px 8px; border-radius: 4px; color: #fff; letter-spacing: .03em; }
-.sns-bluesky { background: #1167d8; }
-.sns-mastodon { background: #5c4dd6; }
-.sns-misskey { background: #5f8a1e; }
 .sns-x { background: #111; }
-:root[data-theme="dark"] .sns-x { background: #444; }
-@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .sns-x { background: #444; } }
+.sns-threads { background: #333; }
+.sns-instagram { background: linear-gradient(45deg, #f09433, #dc2743 50%, #bc1888); }
+:root[data-theme="dark"] .sns-x, :root[data-theme="dark"] .sns-threads { background: #444; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .sns-x, :root:not([data-theme="light"]) .sns-threads { background: #444; } }
+.trend-no { font: 800 1.1rem/1 var(--f-display); color: var(--ai); min-width: 1.6em; }
+.trend-posts { display: grid; gap: 4px; font-size: .9rem; }
+.trend-posts a { color: inherit; text-decoration: none; border-left: 3px solid var(--line); padding-left: 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

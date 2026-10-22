@@ -19,7 +19,7 @@
 | 年間・月間の読書記録 | 記録タブ | 月別グラフ、分類の内訳、よく読んだ作家、高評価の本 |
 | 図書館予約サイトとの連動 | 詳細画面「図書館で借りる」 | カーリルAPIで貸出状況を確認し、各図書館の予約ページを開く |
 | よく行く図書館の登録 | 図書館・賞タブ | 都道府県・市区町村から検索して登録 |
-| SNSで今日話題になった情報 | 話題タブ | Bluesky・Mastodon・Misskey の公開APIから今日の人気投稿・トレンドを取得。対象のSNSを選択でき、「本の話題」と「すべての話題」を切り替え可能。各話題に根拠（反応数・トレンド順位・昨日比など）と想定される理由（言葉と反応傾向からの推定）を表示。X は公開APIがないため検索ページへのリンクのみ |
+| SNSで今日話題になった情報 | 話題タブ | X・Threads・Instagram から選択（初期値はすべて）。トレンド順位・投稿数・トレンド入りの時刻などの根拠と、関連ニュースや言葉から推定した理由を表示 |
 | 直木賞・芥川賞の受賞履歴 | 図書館・賞タブ | 第142回（2009年下期）〜第175回（2026年上期）。読了した作品には印がつく |
 
 ## 起動方法
@@ -40,6 +40,18 @@ python3 -m http.server 8000
 
 - **カーリル アプリケーションキー**（図書館連携に必須）: https://calil.jp/api/dashboard/ で無料発行
 - **Google Books APIキー**（任意）: 検索回数が多く制限にかかる場合のみ
+
+## SNSの話題の更新
+
+X・Threads・Instagram はブラウザから直接データを読めないため、GitHub Actions（`.github/workflows/trends.yml`）が1時間ごとに `scripts/fetch-trends.mjs` を実行し、`data/trends.json` を更新します。手動で更新するときは Actions の「SNSの話題を更新」から「Run workflow」を押します。
+
+| SNS | 取得元 | 設定 |
+| --- | --- | --- |
+| X | trends24.in（X の日本のトレンドを1時間ごとに記録）。読めないときは Yahoo!リアルタイム検索 | 不要 |
+| Threads | Threads API のキーワード検索（人気順） | リポジトリの Secrets に `THREADS_ACCESS_TOKEN`（`threads_keyword_search` の権限が必要） |
+| Instagram | Instagram Graph API のハッシュタグ検索 | Secrets に `IG_USER_ID` と `IG_ACCESS_TOKEN`。ハッシュタグ検索は7日間で30種類までのため、1回に上位3件だけ調べます |
+
+想定される理由の手がかりとして、Google の急上昇ワードと関連ニュース（RSS）も取得しています。Threads・Instagram のキーが未登録の間は、各話題に「Threadsで見る」「Instagramで見る」のリンクだけを表示します。
 
 ## データの保存
 
