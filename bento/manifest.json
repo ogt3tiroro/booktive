@@ -1,0 +1,12 @@
+{
+  "name": "お弁当ツクール",
+  "short_name": "お弁当",
+  "description": "1週間のお弁当献立をおまかせで。材料から探す・詰め方・スープジャー・ヘビロテレシピ",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f8f4ec",
+  "theme_color": "#b8452f",
+  "lang": "ja",
+  "icons": [{ "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
