@@ -1,0 +1,12 @@
+{
+  "name": "面接練習ノート",
+  "short_name": "面接練習",
+  "description": "よく聞かれる質問の回答づくり・音声入力・AI添削・書類からの想定質問",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f4f5f2",
+  "theme_color": "#1f4f4a",
+  "lang": "ja",
+  "icons": [{ "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
