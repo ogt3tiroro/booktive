@@ -68,6 +68,8 @@
     n = n.replace(/[\/／]\s*$/, "").trim();
     // 図書館式の「豊永, 浩平, 2003-」から生没年を取り除く
     n = n.replace(/[,，\s]*\d{4}\s*-\s*(\d{4})?\s*$/, "").trim();
+    // 図書館の貸出履歴などの「北川 敬三(1968~」形式
+    n = n.replace(/\s*[(（]\s*\d{4}\s*[~〜～\-－]?\s*(\d{4})?\s*[)）]?\s*$/, "").trim();
     if (hasCJK(n)) n = n.replace(/[\s,，]+/g, "");
     return n;
   }
@@ -495,7 +497,7 @@
     if (/^9/.test(n)) return "海外の小説";
     if (/^28/.test(n)) return "ノンフィクション";
     if (/^2/.test(n)) return "歴史・時代";
-    if (/^(159|33[56])/.test(n)) return "ビジネス・自己啓発";
+    if (/^(159|33[5-8])/.test(n)) return "ビジネス・自己啓発";
     if (/^(59|7)/.test(n)) return "趣味・実用";
     if (/^[45]/.test(n)) return "科学・技術";
     if (/^[13]/.test(n)) return "人文・社会";
@@ -734,7 +736,7 @@
         <div><span>読みたい本</span><b>${wantCount}<small class="small"> 冊</small></b></div>
       </div>
       <section class="section">
-        <div class="section-head"><h1>本棚</h1><span class="muted small num">全 ${allBooks().length} 冊</span></div>
+        <div class="section-head"><h1>本棚</h1><span class="row"><span class="muted small num">全 ${allBooks().length} 冊</span><a class="btn btn-sm btn-plain" href="#more/import">ファイルから取り込む</a></span></div>
         <div class="chips" id="statusChips">
           ${[["all", "すべて"], ["read", "読了"], ["reading", "読書中"], ["want", "読みたい"]].map(([k, l]) => `<button class="chip" type="button" data-status="${k}" aria-pressed="${shelfState.status === k}">${l}</button>`).join("")}
         </div>
@@ -1370,7 +1372,8 @@
   }
 
   let awardFilter = "both";
-  function renderMore() {
+  function renderMore(args = []) {
+    if (args[0] === "import") setTimeout(() => { const el = $("#migrate"); if (el) el.scrollIntoView({ block: "start" }); }, 0);
     view.innerHTML = `
       <section class="section" id="libs">
         <div class="section-head"><h1>よく行く図書館</h1><span class="muted small num">${data.libraries.length}館</span></div>
@@ -1410,8 +1413,8 @@
           </div>
         </div>
         <div class="panel" id="migrate">
-          <h3>ほかの読書アプリから移行</h3>
-          <p class="muted small" style="margin:0">ビブリアなどで書き出したCSV・テキストファイルを選ぶか、共有した内容をそのまま貼り付けてください。ISBNが入っていれば、書名や表紙は自動で補います。</p>
+          <h3>ファイルから取り込む</h3>
+          <p class="muted small" style="margin:0">図書館の貸出履歴や、ビブリアなどの読書アプリで書き出したCSV・テキストファイルを選ぶか、内容をそのまま貼り付けてください。表紙やISBNは書名と作家名から自動で補います。</p>
           <div class="row">
             <label class="btn btn-plain" for="migrateFile">ファイルを選ぶ</label>
             <input type="file" id="migrateFile" accept=".csv,.tsv,.txt,text/csv,text/plain,text/tab-separated-values" hidden>
@@ -1511,16 +1514,43 @@
     return rows;
   }
 
+  // 見出しの判定は上から順に行う（「出版年」を出版社と、「分類」を状態と取り違えないよう順番に意味がある）
   const COLUMN_RULES = [
     ["isbn", /isbn|jan|コード/i],
     ["title", /タイトル|書名|題名|title|本の名前|作品/i],
     ["author", /著者|作者|作家|author|著/i],
-    ["readDate", /読了|読んだ日|読み終|完了日|finish|date read|日付|date/i],
+    ["readDate", /読了|読んだ日|読み終|完了日|貸出日|借りた日|返却日|finish|date read|日付|date/i],
     ["rating", /評価|星|rating|スコア|score|点/i],
     ["comment", /メモ|感想|コメント|レビュー|review|note|comment/i],
-    ["status", /状態|ステータス|status|分類|棚|shelf|区分/i],
+    ["pubDate", /出版年|発行年|刊行|出版日|発売日|published/i],
+    ["callNo", /分類|請求記号|ndc/i],
+    ["status", /状態|ステータス|status|棚|shelf|区分/i],
     ["publisher", /出版|publisher/i],
   ];
+  // 請求記号（「338ｳ」「Fﾄ」「BFｵ」「S391.2ｷ」）から分類を推定
+  function genreFromCallNo(c) {
+    c = String(c || "").normalize("NFKC").trim();
+    if (!c) return "";
+    if (/^z$/i.test(c)) return "その他";
+    if (/^[A-Z]*F(?![\d.])/i.test(c)) return "日本の小説";
+    const n = c.replace(/^[A-Z]+/i, "").match(/^\d+(\.\d+)?/);
+    return n ? genreFromNdc(n[0]) : "";
+  }
+  // 「書名　副題　　（○○文庫）」を書名・副題・叢書名に分ける
+  function splitImportTitle(raw) {
+    let t = String(raw || "").normalize("NFKC").trim();
+    let series = "";
+    const m = t.match(/\s*[(（]([^()（）]*(文庫|新書|選書|叢書|ブックス|シリーズ)[^()（）]*)[)）]\s*$/);
+    if (m) { series = m[1].trim(); t = t.slice(0, m.index).trim(); }
+    let subtitle = "";
+    if (hasCJK(t)) {
+      const i = t.search(/\s+/);
+      if (i > 0) { subtitle = t.slice(i).trim().replace(/\s+/g, " "); t = t.slice(0, i); }
+    }
+    return { title: t, subtitle, series };
+  }
+  const isMagazine = (x) => /^z$/i.test(String(x.callNo || "").normalize("NFKC").trim())
+    || (!x.authors.length && /(\d+年)?\d+月(\d+日)?号|[春夏秋冬]号|増刊|号\s*[*＊]?\d*$/.test(x.title + " " + x.subtitle));
   function detectColumns(header) {
     const map = {};
     header.forEach((h, i) => {
@@ -1561,20 +1591,32 @@
       for (const r of rows.slice(1)) {
         const get = (k) => (k in map ? r[map[k]] || "" : "");
         const isbn = normalizeIsbnInput(get("isbn"));
-        const title = get("title");
+        const { title, subtitle, series } = splitImportTitle(get("title"));
         if (!isbn && !title) continue;
         const readDate = parseDateLoose(get("readDate"));
-        items.push({
-          isbn, title,
+        const item = {
+          isbn, title, subtitle, series,
           authors: normalizeAuthors(get("author").split(/[／\/、;]|\s{2,}/)),
           readDate,
           rating: parseRating(get("rating")),
           comment: get("comment"),
           status: parseStatus(get("status"), readDate),
-          publisher: get("publisher"),
-        });
+          publisher: get("publisher").normalize("NFKC"),
+          publishedDate: normDate(get("pubDate")),
+          callNo: get("callNo"),
+          genre: genreFromCallNo(get("callNo")),
+        };
+        item.magazine = isMagazine(item);
+        items.push(item);
       }
-      return { mode: "table", map, header, items };
+      // 同じ本を何度も借りている場合は、いちばん新しい日付の1冊にまとめる
+      const byKey = new Map();
+      for (const x of items) {
+        const k = x.isbn || titleKey(x.title) + "|" + x.authors.map(nameKey).join();
+        const prev = byKey.get(k);
+        if (!prev || (x.readDate || "") > (prev.readDate || "")) byKey.set(k, x);
+      }
+      return { mode: "table", map, header, items: [...byKey.values()], duplicates: items.length - byKey.size };
     }
     const isbns = [...new Set((text.normalize("NFKC").match(/97[89][\d\-\s]{10,16}/g) || []).map(normalizeIsbnInput).filter(Boolean))];
     return { mode: "isbn", items: isbns.map((isbn) => ({ isbn, title: "", authors: [], readDate: "", rating: 0, comment: "", status: "read" })) };
@@ -1589,7 +1631,8 @@
         out.innerHTML = `<p class="st-ng small">本の情報を見つけられませんでした。1行目に「タイトル」「著者」「ISBN」などの見出しがある表か、ISBN（978…）の一覧を使ってください。</p>`;
         return;
       }
-      const labels = { isbn: "ISBN", title: "書名", author: "著者", readDate: "読了日", rating: "評価", comment: "感想", status: "状態", publisher: "出版社" };
+      const labels = { isbn: "ISBN", title: "書名", author: "著者", readDate: "読了日", rating: "評価", comment: "感想", status: "状態", publisher: "出版社", pubDate: "出版年", callNo: "分類" };
+      const mags = parsed.items.filter((x) => x.magazine).length;
       const found = parsed.mode === "table" ? Object.keys(parsed.map).map((k) => labels[k]).join("・") : "ISBNのみ（書名などは自動で取得）";
       const statusCount = { want: 0, reading: 0, read: 0 };
       parsed.items.forEach((x) => statusCount[x.status]++);
@@ -1597,7 +1640,10 @@
         <p class="small" style="margin:0"><b class="num">${parsed.items.length}</b> 冊見つかりました（読了 ${statusCount.read}・読書中 ${statusCount.reading}・読みたい ${statusCount.want}）<br><span class="muted">読み取れた項目：${esc(found)}</span></p>
         <div class="book-list">${parsed.items.slice(0, 5).map((x) => `<div class="book-row" style="grid-template-columns:1fr auto;cursor:default"><span class="meta"><span class="t">${esc(x.title || "（ISBN " + x.isbn + "）")}</span><span class="a">${esc(x.authors.join("、"))}${x.readDate ? "・" + esc(x.readDate) : ""}</span></span><span>${tagHtml(x.status)}</span></div>`).join("")}</div>
         ${parsed.items.length > 5 ? `<p class="muted small" style="margin:0">ほか ${parsed.items.length - 5} 冊</p>` : ""}
-        <div><button class="btn" type="button" id="migrateRun">本棚に取り込む</button></div>`;
+        ${"readDate" in (parsed.map || {}) && /貸出|借り|返却/.test(parsed.header[parsed.map.readDate]) ? `<p class="muted small" style="margin:0">「${esc(parsed.header[parsed.map.readDate])}」を読了日として登録します。</p>` : ""}
+        ${parsed.duplicates ? `<p class="muted small" style="margin:0">同じ本を複数回借りた ${parsed.duplicates} 件は、新しい日付の1冊にまとめました。</p>` : ""}
+        ${mags ? `<label class="small"><input type="checkbox" id="migrateMags"> 雑誌（${mags}冊）も取り込む</label>` : ""}
+        <div><button class="btn" type="button" id="migrateRun">読了として本棚に取り込む</button></div>`;
       $("#migrateRun").addEventListener("click", runImport);
     };
 
@@ -1605,7 +1651,8 @@
       const btn = $("#migrateRun");
       btn.disabled = true;
       let added = 0, skipped = 0, failed = 0;
-      const items = parsed.items;
+      const withMags = $("#migrateMags") && $("#migrateMags").checked;
+      const items = parsed.items.filter((x) => withMags || !x.magazine);
       for (let i = 0; i < items.length; i++) {
         btn.textContent = `取り込み中… ${i + 1} / ${items.length}`;
         const x = items[i];
@@ -1616,16 +1663,33 @@
         if (x.isbn) {
           base = await API.byIsbn(x.isbn).catch(() => null);
           await new Promise((r) => setTimeout(r, 250));
+        } else if (x.title && !x.magazine) {
+          // ISBNがない表（図書館の貸出履歴など）は、書名と作家名で本を探して表紙やISBNを補う
+          base = await lookupByTitle(x);
+          await new Promise((r) => setTimeout(r, 300));
         }
         if (!base && !x.title) { failed++; continue; }
-        const book = Object.assign({ id: x.isbn || "m:" + Date.now() + "-" + i, isbn: x.isbn, title: x.title, authors: x.authors, publisher: x.publisher, publishedDate: "", thumbnail: "", description: "", pageCount: 0, genre: "" }, base || {});
-        if (x.title) book.title = x.title;
+        const own = { id: x.isbn || "m:" + Date.now() + "-" + i, isbn: x.isbn, title: x.title, subtitle: x.subtitle, series: x.series, authors: x.authors, publisher: x.publisher, publishedDate: x.publishedDate, thumbnail: "", description: "", pageCount: 0, genre: x.genre };
+        const book = Object.assign({}, own, base || {});
+        if (base && base.isbn) book.id = base.isbn;
+        if (x.title) { book.title = x.title; book.subtitle = x.subtitle || book.subtitle || ""; }
         if (x.authors.length) book.authors = x.authors;
+        if (!book.genre) book.genre = x.genre;
+        if (!book.publishedDate) book.publishedDate = x.publishedDate;
+        if (allBooks().some((b) => b.isbn && b.isbn === book.isbn)) { skipped++; continue; }
         upsertBook(Object.assign(book, { status: x.status, readDate: x.readDate, rating: x.rating, comment: x.comment }));
         added++;
       }
       out.innerHTML = `<p class="small" style="margin:0"><b>${added}</b> 冊を本棚に取り込みました。${skipped ? `すでに登録済みの ${skipped} 冊は飛ばしました。` : ""}${failed ? `<span class="st-ng">本の情報を取得できなかった ${failed} 冊があります。</span>` : ""}</p><div><a class="btn" href="#shelf">本棚を見る</a></div>`;
       toast(`${added}冊を取り込みました`);
+    }
+
+    // 書名と作家名がどちらも合う本だけを採用する（別の本の表紙が付かないように）
+    async function lookupByTitle(x) {
+      const list = await API.search(x.title, "title").catch(() => []);
+      const tk = titleKey(x.title);
+      const ak = x.authors.map(nameKey);
+      return list.find((b) => titleKey(b.title).startsWith(tk) && (!ak.length || (b.authors || []).some((a) => ak.includes(nameKey(a))))) || null;
     }
 
     $("#migratePreview").addEventListener("click", () => preview($("#migrateText").value));

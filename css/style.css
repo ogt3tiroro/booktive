@@ -243,3 +243,4 @@ input[type="date"]::-webkit-date-and-time-value { text-align: left; }
 @keyframes spin { to { transform: rotate(360deg); } }
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
 .detail-head .meta > .tag { justify-self: start; }
+#migrate { scroll-margin-top: calc(var(--topbar-h) + env(safe-area-inset-top, 0px) + 16px); }
